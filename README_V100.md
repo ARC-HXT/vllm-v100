@@ -1,12 +1,17 @@
-# vllm-v100: vLLM 0.19.0 with V100 (sm70, fp16) kernels
+# vllm-v100: vLLM 0.33.0 for V100 (sm70, fp16)
 
-This branch is upstream vLLM `v0.19.0` (commit `2a69949bd`) plus a few commits that speed up decoding on
-NVIDIA V100 (compute capability 7.0) in fp16. Every change sits behind an environment variable that is **off by
-default**; with no variable set the code path is the stock one (checked token by token against an unmodified
-0.19.0 install).
+This branch is upstream vLLM `v0.33.0` (commit `4ba787ec99`) plus:
 
-The kernels are compiled at run time with `torch.utils.cpp_extension.load_inline` (needs `nvcc`, sm70 code only);
-vLLM's own compiled libraries are the ones of the 0.19.0 release (install with precompiled binaries, see below).
+- two build changes, so that vLLM still compiles for NVIDIA V100 (compute capability 7.0): `CMakeLists.txt` keeps
+  `7.0` in the CUDA 12.8 / 12.9 architecture list (upstream dropped it after 0.19; nvcc 12.8 / 12.9 still target
+  sm_70), and requires GCC 13 only when an sm90+ architecture is built (DeepGEMM / DeepSelect; an sm70-only build
+  compiles with GCC 11);
+- the V100 decode switches of the 0.19 branch (`v0.19.0-v100.*` tags), ported to the v0.33 TRITON_ATTN backend.
+  Every switch is **off by default**; with no variable set the code path is the stock one.
+
+Upstream wheels on PyPI do not run on V100 (built with CUDA >= 12.8 for sm75+); this branch is built from source,
+see Build below.  The decode kernels are compiled at run time with `torch.utils.cpp_extension.load_inline` (needs
+`nvcc`, sm70 code only).
 
 ## Switches
 
@@ -19,7 +24,9 @@ vLLM's own compiled libraries are the ones of the 0.19.0 release (install with p
 
 Only the value `1` turns a switch on. Conditions for the decode kernel: fp16 KV cache (`kv_cache_dtype=auto` with
 `dtype=float16`), head size 128, 4 query heads per KV head, no ALiBi / sliding window / soft cap / sinks / output
-quantisation / multimodal prefix ranges; anything else runs the stock kernel.
+quantisation / multimodal prefix ranges / R-SWA; anything else runs the stock kernel.  v0.33 stores K and V of a
+token in one cache row (`[blocks, kv_heads, page, 2 * 128]`); the backend passes strided `[blocks, page, kv_heads,
+128]` views and the kernels read through the strides.
 
 ## GEMM table
 
@@ -38,25 +45,26 @@ and RMS errors against an fp32 reference were not worse (split-K only with fp32 
 Measured on V100 at the profiled production batch (graph sizes 168 / 176 / 184): qkv about 15 % and down about 8 %
 faster; at batch 256 neither shape gains and both fall back.
 
-## Install (precompiled vLLM libraries, no CUDA build of vLLM)
+## Build (sm70 only, from source)
+
+Tested on Ubuntu 22.04, GCC 11.4, CUDA 12.8 toolkit, driver 580, Python 3.13:
 
 ```bash
-git clone <this repository> vllm-v100 && cd vllm-v100
-VLLM_USE_PRECOMPILED=1 VLLM_PRECOMPILED_WHEEL_COMMIT=2a69949bdadf0e8942b7a1619b229cb475beef20 \
-    uv pip install --editable .
+uv venv <venv> --python 3.13
+uv pip install -p <venv>/bin/python torch==2.14.0+cu126 --find-links <pytorch cu126 wheel index>  # keeps sm_70
+uv pip install -p <venv>/bin/python -r requirements/build/cuda.txt  # torch==2.14.0 is satisfied by +cu126
+export CUDA_HOME=/usr/local/cuda-12.8 PATH=<venv>/bin:/usr/local/cuda-12.8/bin:$PATH
+export TORCH_CUDA_ARCH_LIST=7.0 MAX_JOBS=32 VLLM_VERSION_OVERRIDE=0.33.0+v100.1
+python -m build --wheel --no-isolation --skip-dependency-check .
+uv pip install -p <venv>/bin/python dist/vllm-0.33.0+v100.1-*.whl --find-links <pytorch cu126 wheel index>
 ```
 
-With a local copy of the 0.19.0 wheel, use `VLLM_PRECOMPILED_WHEEL_LOCATION=<wheel>` instead of
-`VLLM_PRECOMPILED_WHEEL_COMMIT`.
-
-Offline machine that already has the vLLM 0.19.0 release wheel installed (every other `vllm/*.py` file of the wheel
-is identical to the `v0.19.0` tag; checked on 1470 files): copy only the changed files into a copy of that
-environment:
-
-```bash
-cp -a <venv with vllm 0.19.0> <new venv>
-tools/attpatt_v100/overlay_install.sh <new venv>/lib/python3.X/site-packages
-```
+Without access to github.com, point CMake at local source trees of its fetched dependencies (revisions are the ones
+in `CMakeLists.txt` and `cmake/external_projects/*.cmake`, plus their git submodules): `VLLM_CUTLASS_SRC_DIR`,
+`VLLM_FLASH_ATTN_SRC_DIR`, `DEEPGEMM_SRC_DIR`, `DEEPSELECT_SRC_DIR`, `FLASH_KDA_SRC_DIR`, `FLASH_MLA_SRC_DIR`,
+`FMHA_SM100_SRC_DIR`, `QUTLASS_SRC_DIR`, `TML_FA4_SRC_DIR`, `TRITON_KERNELS_SRC_DIR`.  For sm70 nothing of them is
+compiled, but their files are installed into the wheel.  Triton 3.8 (pulled in by torch 2.14) ships ptxas 12.9,
+which still targets sm_70.
 
 ## Tests
 
@@ -64,9 +72,11 @@ tools/attpatt_v100/overlay_install.sh <new venv>/lib/python3.X/site-packages
 CUDA_VISIBLE_DEVICES=<an sm70 GPU> python -m pytest --noconftest -q tests/attpatt_v100
 ```
 
-`--noconftest` skips vLLM's global `tests/conftest.py`, which needs the full test requirements. With the overlay
-install, run the tests from a directory that holds only `tests/` (the source tree's `vllm/` has no compiled
-libraries and would shadow the installed package).
+`--noconftest` skips vLLM's global `tests/conftest.py`, which needs the full test requirements. Run the tests from
+a directory that holds only `tests/` when the source tree has not been built in place (its `vllm/` would shadow the
+installed package).  GitHub Actions (`.github/workflows/attpatt-v100-cpu.yml`) runs the CPU part on every push to a
+`v100-*` branch: the switch-off paths of `test_switches.py`; switch-on and kernel tests need an sm70 GPU and are
+skipped there.
 
 ## Known limits
 
