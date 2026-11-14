@@ -13,6 +13,7 @@ vLLM's own compiled libraries are the ones of the 0.19.0 release (install with p
 | Variable | Effect |
 |---|---|
 | `ATTPATT_V100_DECODE=1` | TRITON_ATTN backend: decode-only batches (query length 1) use a CUDA decode kernel (`vllm/attpatt_v100/decode_attention.py`) instead of the Triton kernel, which on sm70 is bound by the shared-memory pipe. |
+| `ATTPATT_V100_MIXED=1` (with `DECODE`) | Mixed prefill + decode batches: the metadata builder asks the runner to put decode requests first; their rows use the CUDA decode kernel and only the prefill rows go to the Triton kernel. |
 
 Only the value `1` turns a switch on. Conditions for the decode kernel: fp16 KV cache (`kv_cache_dtype=auto` with
 `dtype=float16`), head size 128, 4 query heads per KV head, no ALiBi / sliding window / soft cap / sinks / output

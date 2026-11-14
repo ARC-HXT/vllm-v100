@@ -13,7 +13,8 @@ SWITCHES = ("ATTPATT_V100_DECODE", "ATTPATT_V100_MIXED", "ATTPATT_V100_SPLIT", "
 PROBE = r"""
 import json
 import vllm.v1.attention.backends.triton_attn as T
-out = {"decode": None if T._attpatt_v100_decode is None else T._attpatt_v100_decode.__module__}
+out = {"decode": None if T._attpatt_v100_decode is None else T._attpatt_v100_decode.__module__,
+       "mixed": T._attpatt_mixed}
 print("PROBE" + json.dumps(out))
 """
 
@@ -35,3 +36,9 @@ def test_decode_off_unless_exactly_1(value):
 
 def test_decode_on_binds_the_cuda_kernel():
     assert probe({"ATTPATT_V100_DECODE": "1"})["decode"] == "vllm.attpatt_v100.decode_attention"
+
+
+def test_mixed_needs_decode():
+    assert probe({"ATTPATT_V100_MIXED": "1"})["mixed"] is False
+    assert probe({"ATTPATT_V100_DECODE": "1"})["mixed"] is False
+    assert probe({"ATTPATT_V100_DECODE": "1", "ATTPATT_V100_MIXED": "1"})["mixed"] is True

@@ -38,6 +38,9 @@ _attpatt_v100_decode = None
 if _os.environ.get("ATTPATT_V100_DECODE") == "1":  # attpatt V100 decode patch
     from vllm.attpatt_v100.decode_attention import _load as _attpatt_load, decode_attention as _attpatt_v100_decode
     _attpatt_load()  # build / load the extension now, never inside CUDA graph capture
+_attpatt_mixed = _attpatt_v100_decode is not None and _os.environ.get("ATTPATT_V100_MIXED") == "1"  # attpatt V100 mixed-batch patch
+if _attpatt_mixed:
+    from vllm.v1.attention.backends.utils import split_decodes_and_prefills as _attpatt_split
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
@@ -132,6 +135,8 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
 
         self.block_size = kv_cache_spec.block_size
+        if _attpatt_mixed:  # attpatt V100 mixed-batch patch: decode requests first in every batch
+            self._init_reorder_batch_threshold(1)
 
         model_config = vllm_config.model_config
         self.num_heads_q = model_config.get_num_attention_heads(
@@ -256,6 +261,8 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             softmax_segm_max=self.softmax_segm_max,
             softmax_segm_expsum=self.softmax_segm_expsum,
         )
+        # attpatt V100 mixed-batch patch: number of leading decode requests (query length 1)
+        attn_metadata.attpatt_num_decodes = _attpatt_split(common_attn_metadata, 1)[0] if _attpatt_mixed else 0
         return attn_metadata
 
 
@@ -507,11 +514,25 @@ class TritonAttentionImpl(AttentionImpl):
             _attpatt_v100_decode(query[:num_actual_tokens], key_cache, value_cache, output[:num_actual_tokens],
                                  block_table, seqused_k, self.scale)
             return output
+        q_lo = 0
+        nd = getattr(attn_metadata, "attpatt_num_decodes", 0)
+        if (nd > 0 and key_cache.dtype == torch.float16
+                and self.alibi_slopes is None and tuple(self.sliding_window) == (-1, -1) and not self.logits_soft_cap
+                and self.sinks is None and output_scale is None and mm_prefix_range_tensor is None
+                and query.shape[2] == 128 and query.shape[1] == 4 * key_cache.shape[2]):  # attpatt V100 mixed-batch patch
+            # rows [0, nd) are decode requests with one query token each: CUDA kernel; the rest: stock kernel
+            _attpatt_v100_decode(query[:nd], key_cache, value_cache, output[:nd], block_table[:nd], seqused_k[:nd],
+                                 self.scale)
+            q_lo = nd
+            cu_seqlens_q = cu_seqlens_q[nd:] - nd
+            seqused_k = seqused_k[nd:]
+            block_table = block_table[nd:]
+            descale_shape = (cu_seqlens_q.shape[0] - 1, key_cache.shape[2])
         unified_attention(
-            q=query[:num_actual_tokens],
+            q=query[q_lo:num_actual_tokens],
             k=key_cache,
             v=value_cache,
-            out=output[:num_actual_tokens],
+            out=output[q_lo:num_actual_tokens],
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
             seqused_k=seqused_k,
