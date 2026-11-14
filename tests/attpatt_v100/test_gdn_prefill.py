@@ -34,19 +34,19 @@ def inputs(lengths, heads=2, value_heads=4, seed=23):
     return q, k, v, g, beta, h0, cu
 
 
-def reference(q, k, v, g, beta, h0, cu, normalize=True):
-    q, k = q.float(), k.float()
+def reference(q, k, v, g, beta, h0, cu, normalize=True, dtype=torch.float32):
+    q, k = q.to(dtype), k.to(dtype)
     if normalize:
         q, k = [
             x * torch.rsqrt(x.square().sum(-1, keepdim=True) + 1e-6) for x in (q, k)
         ]
-    v, beta = v.float(), beta.float()
+    v, beta, g = v.to(dtype), beta.to(dtype), g.to(dtype)
     repeat = v.shape[2] // q.shape[2]
     out = torch.empty_like(v)
     states = []
     offsets = cu.cpu().tolist()
     for seq, (begin, end) in enumerate(itertools.pairwise(offsets)):
-        h = h0[seq].float().clone()
+        h = h0[seq].to(dtype).clone()
         for t in range(begin, end):
             qt = q[0, t].repeat_interleave(repeat, 0)
             kt = k[0, t].repeat_interleave(repeat, 0)
@@ -56,6 +56,21 @@ def reference(q, k, v, g, beta, h0, cu, normalize=True):
             out[0, t] = (h * qt[:, None, :]).sum(-1) * 128**-0.5
         states.append(h)
     return out, torch.stack(states)
+
+
+def test_reference_supports_float64_against_one_token_closed_form():
+    q = k = torch.ones(1, 1, 1, 128, dtype=torch.float16)
+    v = torch.full_like(q, 2)
+    g = torch.zeros(1, 1, 1)
+    beta = torch.full_like(g, 0.5)
+    h0 = torch.zeros(1, 1, 128, 128)
+    cu = torch.tensor([0, 1], dtype=torch.int32)
+    out, final = reference(
+        q, k, v, g, beta, h0, cu, normalize=False, dtype=torch.float64
+    )
+    assert out.dtype == final.dtype == torch.float64
+    torch.testing.assert_close(final, torch.ones_like(final))
+    torch.testing.assert_close(out, torch.full_like(out, 128**0.5))
 
 
 @pytest.mark.parametrize("lengths", [[0, 1, 63, 65, 0], [129, 2, 7], [0, 0]])
