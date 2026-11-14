@@ -47,6 +47,8 @@ def main():
     parser.add_argument("--out", required=True)
     parser.add_argument("--inputs-only", action="store_true")
     args = parser.parse_args()
+    # Queue the entire frozen batch before any GPU step can start.
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     dest = Path(args.out)
     dest.mkdir(parents=True, exist_ok=True)
     from transformers import AutoTokenizer
@@ -108,6 +110,7 @@ def main():
         gpu_memory_utilization=0.85,
         kv_cache_memory_bytes=2 << 30,
         enable_prefix_caching=False,
+        async_scheduling=False,
         enforce_eager=False,
         compilation_config={"cudagraph_capture_sizes": [1, 2, 4, 8, 16]},
         limit_mm_per_prompt={"image": 0, "video": 0},
@@ -170,6 +173,8 @@ def main():
             dtype="float16",
             graphs=True,
             prefix_caching=False,
+            engine_multiprocessing=False,
+            async_scheduling=False,
             max_model_len=40960,
             max_num_batched_tokens=2048,
             scored=scored,

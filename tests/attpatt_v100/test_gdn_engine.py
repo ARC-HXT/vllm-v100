@@ -8,8 +8,13 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 
+@pytest.mark.skipif(
+    os.environ.get("ATTPATT_GDN_RUN_ENGINE_TEST") != "1",
+    reason="opt-in model gate: set ATTPATT_GDN_RUN_ENGINE_TEST=1 and a local model",
+)
 def test_real_engine_gdn_prefill_with_and_without_the_switch(tmp_path):
     probe = Path(__file__).with_name("_gdn_engine.py")
     results = []

@@ -7,7 +7,10 @@ import os
 import pytest
 import torch
 
-from vllm.attpatt_v100.gdn_prefill import recurrent_prefill
+if not torch.cuda.is_available():
+    pytest.skip("needs a CUDA GPU", allow_module_level=True)
+
+from vllm.attpatt_v100.gdn_prefill import recurrent_prefill  # noqa: E402
 
 
 def inputs(lengths, heads=2, value_heads=4, seed=23):
@@ -141,7 +144,9 @@ def make_op():
         ChunkGatedDeltaRule,
     )
 
-    model = os.environ["ATTPATT_GDN_TEST_MODEL"]
+    model = os.environ.get("ATTPATT_GDN_TEST_MODEL")
+    if not model:
+        pytest.skip("set ATTPATT_GDN_TEST_MODEL to a local Qwen3.5 config")
     cfg = VllmConfig(
         model_config=ModelConfig(model=model, dtype="float16", max_model_len=40960),
         additional_config={"gdn_prefill_backend": "triton"},
@@ -208,9 +213,10 @@ def test_existing_recurrent_modes_are_bitwise_equal_to_release3(inplace, specula
     )
 
     name = "vllm.third_party.flash_linear_attention.ops.recurrent_release3"
-    spec = importlib.util.spec_from_file_location(
-        name, os.environ["ATTPATT_GDN_BASELINE_SOURCE"]
-    )
+    source = os.environ.get("ATTPATT_GDN_BASELINE_SOURCE")
+    if not source:
+        pytest.skip("set ATTPATT_GDN_BASELINE_SOURCE to the v100.3 recurrent source")
+    spec = importlib.util.spec_from_file_location(name, source)
     old = importlib.util.module_from_spec(spec)
     sys.modules[name] = old
     spec.loader.exec_module(old)

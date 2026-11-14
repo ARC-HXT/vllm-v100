@@ -26,6 +26,13 @@ see Build below.  The decode kernels are compiled at run time with `torch.utils.
 | `ATTPATT_V100_GDN_PREFILL=1` | Independent opt-in for GDN prefill on sm70: fp16 Q/K/V, 128-dimensional key/value heads and fp32 initial states use the existing recurrent update kernel with compact per-sequence states and a single final-state write. No per-token state pool or slot-index table is allocated. Initial states remain unchanged; zero-length rows, external output buffers and CUDA graph replay are supported. Other devices, dtypes and head dimensions retain the selected original backend. The switch joins the compile cache key and must be set before engine creation. |
 
 The on/off switches use `1`; `PREFILL` also accepts `2`, and `QK_GROUP` is a selector accepting `1` or `8`.
+
+**GDN prefill is an experimental candidate, not an accepted release feature.** Kernel and graph tests pass,
+but the Qwen3.5-9B fp16 full-model teacher-forced on/off comparison currently exceeds the numerical acceptance
+thresholds. The switch remains off; do not enable it for scored experiments until that difference is resolved.
+The existing full-attention fast-path entry requires head dimension 128 and Q/KV head ratio 4 for both decode
+and prefill. Model-family membership alone does not imply that an optimization is selected.
+
 Set variables before worker startup. Use a release-specific `TORCH_EXTENSIONS_DIR` and precompile both QK groups
 before dispatch; check for abandoned build locks without removing locks held by active compilers.
 Conditions for the decode kernel: fp16 KV cache (`kv_cache_dtype=auto` with
@@ -124,6 +131,12 @@ a directory that holds only `tests/` when the source tree has not been built in 
 installed package).  GitHub Actions (`.github/workflows/attpatt-v100-cpu.yml`) runs the CPU part on every push to a
 `v100-*` branch: the switch-off paths of `test_switches.py`; switch-on and kernel tests need an sm70 GPU and are
 skipped there.
+
+The GDN dispatch checks need `ATTPATT_GDN_TEST_MODEL` pointing at a local Qwen3.5 configuration; the four
+previous-mode checks also need `ATTPATT_GDN_BASELINE_SOURCE` pointing at the original v100.3
+`fused_recurrent.py`. Without these fixtures those checks skip explicitly. To run the separate, currently
+failing real-model numerical gate, also set `ATTPATT_GDN_RUN_ENGINE_TEST=1` and select
+`tests/attpatt_v100/test_gdn_engine.py`. It loads real weights and must run on an exclusively assigned card.
 
 ## Known limits
 
