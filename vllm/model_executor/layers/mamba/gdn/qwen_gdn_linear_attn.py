@@ -377,6 +377,11 @@ class ChunkGatedDeltaRule(CustomOp):
         vllm_config = get_current_vllm_config()
         backend, active_backend = _resolve_gdn_prefill_backend(vllm_config)
         self.gdn_prefill_backend = active_backend
+        self._v100_recurrent_prefill = (
+            os.environ.get("ATTPATT_V100_GDN_PREFILL") == "1"
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability(70)
+        )
 
         if backend in ("flashinfer", "cutedsl") and active_backend != backend:
             logger.warning_once(
@@ -447,6 +452,27 @@ class ChunkGatedDeltaRule(CustomOp):
         core_attn_out: torch.Tensor | None = None,
         aiter_prefill_metadata: object | None = None,
     ):
+        if (
+            self._v100_recurrent_prefill
+            and q.dtype == k.dtype == v.dtype == torch.float16
+            and k.shape[-1] == v.shape[-1] == 128
+            and initial_state is not None
+            and initial_state.dtype == torch.float32
+        ):
+            from vllm.attpatt_v100.gdn_prefill import recurrent_prefill
+
+            return recurrent_prefill(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                core_attn_out=core_attn_out,
+            )
         return fla_chunk_gated_delta_rule(
             q=q,
             k=k,

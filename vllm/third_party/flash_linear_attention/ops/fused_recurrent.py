@@ -59,6 +59,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     IS_CONTINUOUS_BATCHING: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
     IS_KDA: tl.constexpr,
+    FINAL_STATE_ONLY: tl.constexpr = False,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -74,7 +75,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         bos, eos = i_n * T, i_n * T + T
         all = B * T
 
-    if T == 0:
+    if T == 0 and not FINAL_STATE_ONLY:
         # no tokens to process for this sequence
         return
 
@@ -102,7 +103,10 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
 
     b_h = tl.zeros([BV, BK], dtype=tl.float32)
     if USE_INITIAL_STATE:
-        if IS_CONTINUOUS_BATCHING:
+        if FINAL_STATE_ONLY:
+            # Compact prefill states include sequence zero, unlike pool slot zero.
+            p_h0 = h0 + i_n * stride_init_state_token
+        elif IS_CONTINUOUS_BATCHING:
             if IS_SPEC_DECODING:
                 i_t = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
             else:
@@ -150,7 +154,9 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
         # keep the states for multi-query tokens
-        if INPLACE_FINAL_STATE:
+        if FINAL_STATE_ONLY:
+            pass
+        elif INPLACE_FINAL_STATE:
             # Load state index and check for invalid entries
             final_state_idx = tl.load(
                 ssm_state_indices + i_n * stride_indices_seq + i_t
@@ -175,6 +181,11 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
             p_gk += HV * K
         p_beta += HV * (V if IS_BETA_HEADWISE else 1)
 
+    if FINAL_STATE_ONLY:
+        p_ht = ht + i_n * stride_final_state_token
+        p_ht += i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+        tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+
 
 def fused_recurrent_gated_delta_rule_fwd(
     q: torch.Tensor,
@@ -189,6 +200,7 @@ def fused_recurrent_gated_delta_rule_fwd(
     ssm_state_indices: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
+    final_state_only: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
@@ -200,7 +212,12 @@ def fused_recurrent_gated_delta_rule_fwd(
     num_warps = 1
 
     o = q.new_empty(NK, *v.shape)
-    if inplace_final_state:
+    if final_state_only:
+        assert not inplace_final_state
+        assert ssm_state_indices is None and num_accepted_tokens is None
+        assert initial_state.shape[0] == N
+        final_state = torch.empty_like(initial_state)
+    elif inplace_final_state:
         final_state = initial_state
     else:
         final_state = q.new_empty(T, HV, V, K, dtype=initial_state.dtype)
@@ -246,6 +263,7 @@ def fused_recurrent_gated_delta_rule_fwd(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         INPLACE_FINAL_STATE=inplace_final_state,
         IS_KDA=False,
+        FINAL_STATE_ONLY=final_state_only,
         num_warps=num_warps,
         num_stages=num_stages,
     )
