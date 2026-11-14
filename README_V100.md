@@ -24,7 +24,10 @@ see Build below.  The decode kernels are compiled at run time with `torch.utils.
 | `ATTPATT_V100_PREFILL=2` (with `DECODE` + `MIXED`) | Prefill / recompute rows of mixed and prefill batches run on tensor cores through torch's cutlass memory-efficient attention (`torch.ops.aten._efficient_attention_forward`, sm70 kernels in libtorch; `vllm/attpatt_v100/prefill_attention.py`): per request, its KV pages are gathered through the block table (4 KiB per token) and GQA is a stride-0 broadcast, causal mask aligned bottom-right. Host lengths come from `seq_lens_cpu_upper_bound`, so the path is off with speculative decoding. V100, Qwen3-4B, 3 prompts of 30k tokens: 291 -> 2713 prompt tok/s; 2048-token chunk over 32k history 425.6 -> 34.6 ms (32.8 TF/s). `=1` uses the 1Cat-vLLM flash-attention-v100 paged prefill kernel instead (JIT from sources at `$ATTPATT_FA_V100_SRC`, not shipped; 1177 prompt tok/s). |
 | `ATTPATT_V100_GEMM=1` | Unquantized linear layers of the Qwen3-4B qkv (K=2560, N=6144) and down (K=9728, N=2560) shapes use a cuBLASLt algorithm chosen per (M, N, K) for every CUDA graph capture size (`vllm/attpatt_v100/gemm.py`), registered as a custom op; every other layer and shape runs `F.linear`. The switch is part of the torch.compile cache key. |
 
-Only the value `1` turns a switch on. Conditions for the decode kernel: fp16 KV cache (`kv_cache_dtype=auto` with
+The on/off switches use `1`; `PREFILL` also accepts `2`, and `QK_GROUP` is a selector accepting `1` or `8`.
+Set variables before worker startup. Use a release-specific `TORCH_EXTENSIONS_DIR` and precompile both QK groups
+before dispatch; check for abandoned build locks without removing locks held by active compilers.
+Conditions for the decode kernel: fp16 KV cache (`kv_cache_dtype=auto` with
 `dtype=float16`), head size 128, 4 query heads per KV head, no ALiBi / sliding window / soft cap / sinks / output
 quantisation / multimodal prefix ranges / R-SWA; anything else runs the stock kernel.  v0.33 stores K and V of a
 token in one cache row (`[blocks, kv_heads, page, 2 * 128]`); the backend passes strided `[blocks, page, kv_heads,
