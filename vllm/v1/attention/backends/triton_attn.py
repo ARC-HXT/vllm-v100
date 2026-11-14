@@ -33,6 +33,11 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
 )
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+import os as _os
+_attpatt_v100_decode = None
+if _os.environ.get("ATTPATT_V100_DECODE") == "1":  # attpatt V100 decode patch
+    from vllm.attpatt_v100.decode_attention import _load as _attpatt_load, decode_attention as _attpatt_v100_decode
+    _attpatt_load()  # build / load the extension now, never inside CUDA graph capture
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
@@ -495,6 +500,13 @@ class TritonAttentionImpl(AttentionImpl):
         descale_shape = (cu_seqlens_q.shape[0] - 1, key_cache.shape[2])
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
+        if (_attpatt_v100_decode is not None and max_seqlen_q == 1 and key_cache.dtype == torch.float16
+                and self.alibi_slopes is None and tuple(self.sliding_window) == (-1, -1) and not self.logits_soft_cap
+                and self.sinks is None and output_scale is None and mm_prefix_range_tensor is None
+                and query.shape[2] == 128 and query.shape[1] == 4 * key_cache.shape[2]):  # attpatt V100 decode patch
+            _attpatt_v100_decode(query[:num_actual_tokens], key_cache, value_cache, output[:num_actual_tokens],
+                                 block_table, seqused_k, self.scale)
+            return output
         unified_attention(
             q=query[:num_actual_tokens],
             k=key_cache,
