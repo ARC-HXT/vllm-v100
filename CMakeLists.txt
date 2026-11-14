@@ -1690,7 +1690,16 @@ endif()
 
 # DeepGEMM and DeepSelect host code uses C++20 <format>, which libstdc++
 # provides only from GCC 13 onward.
-if (VLLM_GPU_LANG STREQUAL "CUDA"
+# vllm-v100: both compile only for sm90 and newer (cmake/external_projects/deepgemm.cmake, deepselect.cmake);
+# a build whose CUDA_ARCHS are all below 9.0 (TORCH_CUDA_ARCH_LIST=7.0) never compiles their host code.
+set(VLLM_NEEDS_GCC13 OFF)
+foreach(_ARCH ${CUDA_ARCHS})
+  string(REGEX REPLACE "[a-z]+$" "" _ARCH_NUM "${_ARCH}")
+  if(_ARCH_NUM VERSION_GREATER_EQUAL 9.0)
+    set(VLLM_NEEDS_GCC13 ON)
+  endif()
+endforeach()
+if (VLLM_GPU_LANG STREQUAL "CUDA" AND VLLM_NEEDS_GCC13
     AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
     AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "13")
   message(FATAL_ERROR
