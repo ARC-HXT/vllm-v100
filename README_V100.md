@@ -13,6 +13,7 @@ vLLM's own compiled libraries are the ones of the 0.19.0 release (install with p
 | Variable | Effect |
 |---|---|
 | `ATTPATT_V100_DECODE=1` | TRITON_ATTN backend: decode-only batches (query length 1) use a CUDA decode kernel (`vllm/attpatt_v100/decode_attention.py`) instead of the Triton kernel, which on sm70 is bound by the shared-memory pipe. |
+| `ATTPATT_V100_SPLIT=1` (with `DECODE`) | The decode kernel is the split-KV version (`vllm/attpatt_v100/decode_attention_split.py`): partitions of 512 tokens plus a reduce kernel, so few long sequences still fill the GPU. Its fp32 scratch is reserved when the TRITON_ATTN metadata builder is created (before CUDA graph capture), outside `gpu_memory_utilization`: max_num_seqs x query heads x ceil(max_model_len / 512) x 130 x 4 bytes (about 136 MB for 256 sequences, 32 heads, 16k context). |
 | `ATTPATT_V100_MIXED=1` (with `DECODE`) | Mixed prefill + decode batches: the metadata builder asks the runner to put decode requests first; their rows use the CUDA decode kernel and only the prefill rows go to the Triton kernel. |
 
 Only the value `1` turns a switch on. Conditions for the decode kernel: fp16 KV cache (`kv_cache_dtype=auto` with

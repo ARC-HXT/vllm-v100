@@ -14,7 +14,8 @@ PROBE = r"""
 import json
 import vllm.v1.attention.backends.triton_attn as T
 out = {"decode": None if T._attpatt_v100_decode is None else T._attpatt_v100_decode.__module__,
-       "mixed": T._attpatt_mixed}
+       "mixed": T._attpatt_mixed,
+       "reserve": None if T._attpatt_v100_reserve is None else T._attpatt_v100_reserve.__module__}
 print("PROBE" + json.dumps(out))
 """
 
@@ -36,6 +37,14 @@ def test_decode_off_unless_exactly_1(value):
 
 def test_decode_on_binds_the_cuda_kernel():
     assert probe({"ATTPATT_V100_DECODE": "1"})["decode"] == "vllm.attpatt_v100.decode_attention"
+
+
+def test_split_selects_the_split_kernel_and_its_scratch_reserve():
+    p = probe({"ATTPATT_V100_DECODE": "1", "ATTPATT_V100_SPLIT": "1"})
+    assert p["decode"] == p["reserve"] == "vllm.attpatt_v100.decode_attention_split"
+    assert probe({"ATTPATT_V100_DECODE": "1"})["reserve"] is None
+    p = probe({"ATTPATT_V100_SPLIT": "1"})  # split alone does nothing
+    assert p["decode"] is None and p["reserve"] is None
 
 
 def test_mixed_needs_decode():

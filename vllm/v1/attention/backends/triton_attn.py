@@ -35,8 +35,13 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 import os as _os
 _attpatt_v100_decode = None
+_attpatt_v100_reserve = None
 if _os.environ.get("ATTPATT_V100_DECODE") == "1":  # attpatt V100 decode patch
-    from vllm.attpatt_v100.decode_attention import _load as _attpatt_load, decode_attention as _attpatt_v100_decode
+    if _os.environ.get("ATTPATT_V100_SPLIT") == "1":  # attpatt V100 decode patch: split-KV kernel
+        from vllm.attpatt_v100.decode_attention_split import _load as _attpatt_load, decode_attention as _attpatt_v100_decode
+        from vllm.attpatt_v100.decode_attention_split import reserve as _attpatt_v100_reserve
+    else:
+        from vllm.attpatt_v100.decode_attention import _load as _attpatt_load, decode_attention as _attpatt_v100_decode
     _attpatt_load()  # build / load the extension now, never inside CUDA graph capture
 _attpatt_mixed = _attpatt_v100_decode is not None and _os.environ.get("ATTPATT_V100_MIXED") == "1"  # attpatt V100 mixed-batch patch
 if _attpatt_mixed:
@@ -144,6 +149,9 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         )
         self.num_heads_kv = model_config.get_num_kv_heads(vllm_config.parallel_config)
         self.headdim = model_config.get_head_size()
+        if _attpatt_v100_reserve is not None:  # attpatt V100 decode patch: split-KV scratch, before graph capture
+            _attpatt_v100_reserve(device, vllm_config.scheduler_config.max_num_seqs, self.num_heads_q,
+                                  model_config.max_model_len, self.block_size)
 
         # Check if CUDA Graphs are enabled for decode
         self.decode_cudagraph_enabled = (
