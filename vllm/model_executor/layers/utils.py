@@ -15,6 +15,12 @@ from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
+import os as _attpatt_os  # attpatt V100 GEMM patch
+_attpatt_gemm = None
+if _attpatt_os.environ.get("ATTPATT_V100_GEMM") == "1":  # attpatt V100 GEMM patch
+    from vllm.attpatt_v100 import gemm as _attpatt_gemm
+    _attpatt_gemm.register(direct_register_custom_op)
+    _attpatt_gemm.lt._load()  # build / load the extension now, never inside CUDA graph capture
 
 MOE_LAYER_ROUTER_GATE_SUFFIXES = {
     "gate",
@@ -304,5 +310,7 @@ def dispatch_unquantized_gemm() -> Callable[..., torch.Tensor]:
         return rocm_unquantized_gemm
     elif current_platform.is_cpu():
         return cpu_unquantized_gemm
+    elif _attpatt_gemm is not None:  # attpatt V100 GEMM patch
+        return _attpatt_gemm.linear
     else:
         return default_unquantized_gemm

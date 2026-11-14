@@ -1829,6 +1829,8 @@ def compile_factors() -> dict[str, object]:
             continue
 
         factors[factor] = normalize_value(raw)
+    if os.environ.get("ATTPATT_V100_GEMM") == "1":  # attpatt V100 GEMM patch: the switch joins the compile cache key
+        factors["ATTPATT_V100_GEMM"] = "1"
 
     ray_noset_env_vars = [
         # Refer to

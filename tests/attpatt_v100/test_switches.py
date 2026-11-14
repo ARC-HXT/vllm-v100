@@ -47,6 +47,30 @@ def test_split_selects_the_split_kernel_and_its_scratch_reserve():
     assert p["decode"] is None and p["reserve"] is None
 
 
+GEMM_PROBE = r"""
+import json
+import vllm.envs as E
+from vllm.model_executor.layers import utils as U
+fn = U.dispatch_unquantized_gemm()
+print("PROBE" + json.dumps({"dispatch": fn.__module__ + "." + fn.__name__,
+                            "key": E.compile_factors().get("ATTPATT_V100_GEMM")}))
+"""
+
+
+@pytest.mark.parametrize("value", [None, "0", "true"])
+def test_gemm_off_is_the_stock_dispatch_and_cache_key(value):
+    env = {} if value is None else {"ATTPATT_V100_GEMM": value}
+    p = probe(env, GEMM_PROBE)
+    assert p["dispatch"] == "vllm.model_executor.layers.utils.default_unquantized_gemm"
+    assert p["key"] is None
+
+
+def test_gemm_on_dispatches_to_the_table_and_joins_the_compile_cache_key():
+    p = probe({"ATTPATT_V100_GEMM": "1"}, GEMM_PROBE)
+    assert p["dispatch"] == "vllm.attpatt_v100.gemm.linear"
+    assert p["key"] == "1"
+
+
 def test_mixed_needs_decode():
     assert probe({"ATTPATT_V100_MIXED": "1"})["mixed"] is False
     assert probe({"ATTPATT_V100_DECODE": "1"})["mixed"] is False
