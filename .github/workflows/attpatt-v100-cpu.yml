@@ -1,0 +1,38 @@
+name: vllm-v100 CPU tests
+
+# CPU half of the V100 patch tests (tests/attpatt_v100): every switch that is off must leave the stock code path.
+# Kernel tests and switch-on tests build the sm70 CUDA extension and need a V100 (skipped here; see README_V100.md).
+on:
+  push:
+    branches: ['v100-*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  attpatt-v100-cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          python-version: '3.12'
+
+      - name: Install CPU torch and the Python-only vLLM tree
+        run: |
+          uv venv
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+          uv pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cpu
+          uv pip install triton pytest -r requirements/build/cuda.txt --index-strategy unsafe-best-match \
+            --extra-index-url https://download.pytorch.org/whl/cpu
+          VLLM_TARGET_DEVICE=empty uv pip install -e . --no-build-isolation --index-strategy unsafe-best-match \
+            --extra-index-url https://download.pytorch.org/whl/cpu
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: 0.33.0
+
+      - name: Switch tests (off paths)
+        run: python -m pytest --noconftest -q -rs tests/attpatt_v100/test_switches.py
