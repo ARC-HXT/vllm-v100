@@ -10,7 +10,8 @@ import shutil
 
 import pytest
 
-SWITCHES = ("ATTPATT_V100_DECODE", "ATTPATT_V100_MIXED", "ATTPATT_V100_SPLIT", "ATTPATT_V100_GEMM")
+SWITCHES = ("ATTPATT_V100_DECODE", "ATTPATT_V100_MIXED", "ATTPATT_V100_SPLIT", "ATTPATT_V100_GEMM",
+            "ATTPATT_V100_PREFILL")
 
 PROBE = r"""
 import json
@@ -96,3 +97,39 @@ def test_mixed_alone_does_nothing():
 def test_mixed_needs_decode():
     assert probe({"ATTPATT_V100_DECODE": "1"})["mixed"] is False
     assert probe({"ATTPATT_V100_DECODE": "1", "ATTPATT_V100_MIXED": "1"})["mixed"] is True
+
+
+PREFILL_PROBE = r"""
+import json
+import vllm.v1.attention.backends.triton_attn as T
+print("PROBE" + json.dumps({"prefill": None if T._attpatt_prefill is None else T._attpatt_prefill.__module__}))
+"""
+MIXED_ON = {"ATTPATT_V100_DECODE": "1", "ATTPATT_V100_MIXED": "1"}
+
+
+def test_prefill_alone_does_nothing():
+    for value in ("1", "2"):
+        assert probe({"ATTPATT_V100_PREFILL": value}, PREFILL_PROBE)["prefill"] is None
+
+
+@needs_cuda
+@pytest.mark.parametrize("value", [None, "0", "true", "3"])
+def test_prefill_off_unless_1_or_2(value):
+    env = dict(MIXED_ON) if value is None else {**MIXED_ON, "ATTPATT_V100_PREFILL": value}
+    assert probe(env, PREFILL_PROBE)["prefill"] is None
+
+
+@needs_cuda
+def test_prefill_2_selects_the_cutlass_path_and_needs_the_mixed_patch():
+    assert probe({**MIXED_ON, "ATTPATT_V100_PREFILL": "2"}, PREFILL_PROBE)["prefill"] == \
+        "vllm.attpatt_v100.prefill_attention"
+    assert probe({"ATTPATT_V100_DECODE": "1", "ATTPATT_V100_PREFILL": "2"}, PREFILL_PROBE)["prefill"] is None
+
+
+@needs_cuda
+def test_prefill_1_selects_the_flash_v100_path():
+    src = os.environ.get("ATTPATT_FA_V100_SRC", "/opt/attpatt/src/1cat_fa_v100")
+    if not os.path.isdir(os.path.join(src, "kernel")):
+        pytest.skip(f"1Cat flash-attention-v100 sources not found at {src}")
+    assert probe({**MIXED_ON, "ATTPATT_V100_PREFILL": "1"}, PREFILL_PROBE)["prefill"] == \
+        "vllm.attpatt_v100.fa_v100_prefill"

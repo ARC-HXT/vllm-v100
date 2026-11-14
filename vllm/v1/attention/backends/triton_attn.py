@@ -57,6 +57,14 @@ if _os.environ.get("ATTPATT_V100_DECODE") == "1":  # attpatt V100 decode patch
 _attpatt_mixed = _attpatt_v100_decode is not None and _os.environ.get("ATTPATT_V100_MIXED") == "1"  # attpatt V100 mixed-batch patch
 if _attpatt_mixed:
     from vllm.v1.attention.backends.utils import split_decodes_and_prefills as _attpatt_split
+# attpatt V100 prefill patch: prefill rows of mixed / prefill batches on tensor cores; 1 = 1Cat flash-attention-v100
+# paged prefill kernel (JIT), 2 = torch cutlass memory-efficient attention on gathered KV; needs the mixed-batch patch
+_attpatt_prefill = None
+if _attpatt_mixed and _os.environ.get("ATTPATT_V100_PREFILL") == "1":
+    from vllm.attpatt_v100.fa_v100_prefill import _load as _attpatt_prefill_load, prefill_attention as _attpatt_prefill
+    _attpatt_prefill_load()  # build / load the extension now, never inside CUDA graph capture
+elif _attpatt_mixed and _os.environ.get("ATTPATT_V100_PREFILL") == "2":
+    from vllm.attpatt_v100.prefill_attention import prefill_attention as _attpatt_prefill
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVQuantMode,
@@ -123,6 +131,9 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         self.block_size = kv_cache_spec.block_size
         if _attpatt_mixed:  # attpatt V100 mixed-batch patch: decode requests first in every batch
             self._init_reorder_batch_threshold(1)
+        # attpatt V100 prefill patch: the host lengths (seq_lens_cpu_upper_bound) are exact only without speculative
+        # decoding (gpu/model_runner.py: num_computed_tokens_np is an upper bound when drafts can be rejected)
+        self._attpatt_prefill_ok = _attpatt_prefill is not None and vllm_config.speculative_config is None
 
         model_config = vllm_config.model_config
         # Compatible with models with non-uniform per-layer head counts.
@@ -317,6 +328,9 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
 
         # attpatt V100 mixed-batch patch: number of leading decode requests (query length 1)
         attn_metadata.attpatt_num_decodes = _attpatt_split(common_attn_metadata, 1)[0] if _attpatt_mixed else 0
+        if self._attpatt_prefill_ok:  # attpatt V100 prefill patch: per-request token ranges / lengths on the host
+            attn_metadata.attpatt_qsl_cpu = common_attn_metadata.query_start_loc_cpu
+            attn_metadata.attpatt_seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
         return attn_metadata
 
     def update_draft_decode_metadata(self, _metadata: TritonAttentionMetadata) -> None:
@@ -727,6 +741,16 @@ class TritonAttentionImpl(AttentionImpl):
                                      block_table, seqused_k, self.scale)
                 return output
             nd = getattr(attn_metadata, "attpatt_num_decodes", 0)
+            seq_lens_cpu = getattr(attn_metadata, "attpatt_seq_lens_cpu", None)
+            if _attpatt_prefill is not None and seq_lens_cpu is not None and attn_metadata.causal:
+                # attpatt V100 prefill patch: decode rows on the CUDA decode kernel, prefill rows on tensor cores
+                qsl_cpu = attn_metadata.attpatt_qsl_cpu
+                if nd > 0:
+                    _attpatt_v100_decode(query[:nd], key_cache, value_cache, output[:nd], block_table[:nd],
+                                         seqused_k[:nd], self.scale)
+                _attpatt_prefill(query, key_cache, value_cache, output, block_table, qsl_cpu, seq_lens_cpu, nd,
+                                 qsl_cpu.shape[0] - 1, self.scale)
+                return output
             if nd > 0:
                 # rows [0, nd) are decode requests with one query token each: CUDA kernel; the rest: stock kernel
                 _attpatt_v100_decode(query[:nd], key_cache, value_cache, output[:nd], block_table[:nd],
