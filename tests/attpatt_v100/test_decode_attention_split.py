@@ -245,3 +245,68 @@ def test_graph_capture_with_row_chunks_and_padding_rows():
     assert torch.isfinite(out).all()
     assert (out.float() - r).abs().max().item() < 2e-3
     S._reset_for_tests()
+
+def test_long_interleaved_kv_and_zero_length_graph_replay():
+    """Release regression: actual v0.33 strides, 40k capacity and long-context tail."""
+    import os
+    assert S.QK_GROUP == int(os.environ.get("ATTPATT_V100_QK_GROUP", "8"))
+    S._reset_for_tests()
+    lens = [0, 1, 255, 256, 257, 511, 512, 513, 8192, 32768, 40959]
+    q, kc, vc, bt, sl = make_batch(lens, 73, cap=40960)
+    kv = torch.empty(kc.shape[0], 8, 16, 256, device=q.device, dtype=kc.dtype)
+    kv[..., :128].copy_(kc.transpose(1, 2))
+    kv[..., 128:].copy_(vc.transpose(1, 2))
+    k, v = kv[..., :128].transpose(1, 2), kv[..., 128:].transpose(1, 2)
+    k[0].fill_(float("nan")); v[0].fill_(float("nan"))
+    ref = reference_heads(q, k, v, bt, sl, D ** -0.5, 32, 8)
+    S.reserve(q.device, len(lens), 32, 40960, 16)
+    out = torch.empty_like(q)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        S.decode_attention(q, k, v, out, bt, sl, D ** -0.5)
+    graph.replay(); torch.cuda.synchronize()
+    assert torch.isfinite(out).all()
+    assert (out.float() - ref).abs().max().item() < 7.5e-4
+    sl.copy_(torch.tensor([max(1, x - 127) if x else 0 for x in lens], device=q.device, dtype=torch.int32))
+    ref = reference_heads(q, k, v, bt, sl, D ** -0.5, 32, 8)
+    graph.replay(); torch.cuda.synchronize()
+    assert (out.float() - ref).abs().max().item() < 7.5e-4
+    sl.zero_(); out.fill_(float("nan")); graph.replay(); torch.cuda.synchronize()
+    assert torch.equal(out, torch.zeros_like(out))
+    S._reset_for_tests()
+
+
+def test_last_token_of_partial_long_partition_is_not_omitted():
+    S._reset_for_tests()
+    length = 40959
+    q, k, v, bt, sl = make_batch([length], 91, cap=40960)
+    q.zero_(); q[:, :, 0] = 32
+    k.zero_(); v.zero_()
+    last = int(bt[0, (length - 1) // 16])
+    k[last, (length - 1) % 16, :, 0] = 32
+    v[last, (length - 1) % 16] = 0.75
+    k[last, length % 16:].fill_(float("nan"))
+    v[last, length % 16:].fill_(float("nan"))
+    S.reserve(q.device, 1, 32, 40960, 16)
+    out = S.decode_attention(q, k, v, torch.empty_like(q), bt, sl, D ** -0.5)
+    assert torch.equal(out, torch.full_like(out, 0.75))
+    S._reset_for_tests()
+
+
+def test_group1_rollback_is_bitwise_equal_to_release2():
+    import importlib.util
+    import os
+    path = os.environ.get("ATTPATT_V100_ROLLBACK_SOURCE")
+    if S.QK_GROUP != 1 or not path:
+        pytest.skip("set group=1 and ATTPATT_V100_ROLLBACK_SOURCE to the v100.2 module")
+    spec = importlib.util.spec_from_file_location("v100_release2_reference", path)
+    old = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(old)
+    S._reset_for_tests()
+    q, k, v, bt, sl = make_batch([1, 513, 32768], 97, cap=40960)
+    old.reserve(q.device, 3, 32, 40960, 16)
+    S.reserve(q.device, 3, 32, 40960, 16)
+    a = S.decode_attention(q, k, v, torch.empty_like(q), bt, sl, D ** -0.5)
+    b = old.decode_attention(q, k, v, torch.empty_like(q), bt, sl, D ** -0.5)
+    assert torch.equal(a, b)
+    S._reset_for_tests()

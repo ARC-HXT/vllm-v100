@@ -19,6 +19,7 @@ see Build below.  The decode kernels are compiled at run time with `torch.utils.
 |---|---|
 | `ATTPATT_V100_DECODE=1` | TRITON_ATTN backend: decode-only batches (query length 1) use a CUDA decode kernel (`vllm/attpatt_v100/decode_attention.py`) instead of the Triton kernel, which on sm70 is bound by the shared-memory pipe. |
 | `ATTPATT_V100_SPLIT=1` (with `DECODE`) | The decode kernel is the split-KV version (`vllm/attpatt_v100/decode_attention_split.py`): partitions of 512 tokens plus a reduce kernel, so few long sequences still fill the GPU. Its fp32 scratch is reserved when the TRITON_ATTN metadata builder is created (before CUDA graph capture), outside `gpu_memory_utilization`: max_num_seqs x query heads x ceil(max_model_len / 512) x 130 x 4 bytes (about 136 MB for 256 sequences, 32 heads, 16k context). |
+| `ATTPATT_V100_QK_GROUP=8` (default inside `SPLIT`) | Eight threads cooperate on each K row, reuse it for four query heads, and reduce with a fixed subgroup mask. fp16 KV / fp32 accumulation, same 512-token partitions and CUDA graph buffers. `=1` restores the original one-thread-per-token QK. JIT module names include the group so compiled caches cannot collide. |
 | `ATTPATT_V100_MIXED=1` (with `DECODE`) | Mixed prefill + decode batches: the metadata builder asks the runner to put decode requests first; their rows use the CUDA decode kernel and only the prefill rows go to the Triton kernel. |
 | `ATTPATT_V100_PREFILL=2` (with `DECODE` + `MIXED`) | Prefill / recompute rows of mixed and prefill batches run on tensor cores through torch's cutlass memory-efficient attention (`torch.ops.aten._efficient_attention_forward`, sm70 kernels in libtorch; `vllm/attpatt_v100/prefill_attention.py`): per request, its KV pages are gathered through the block table (4 KiB per token) and GQA is a stride-0 broadcast, causal mask aligned bottom-right. Host lengths come from `seq_lens_cpu_upper_bound`, so the path is off with speculative decoding. V100, Qwen3-4B, 3 prompts of 30k tokens: 291 -> 2713 prompt tok/s; 2048-token chunk over 32k history 425.6 -> 34.6 ms (32.8 TF/s). `=1` uses the 1Cat-vLLM flash-attention-v100 paged prefill kernel instead (JIT from sources at `$ATTPATT_FA_V100_SRC`, not shipped; 1177 prompt tok/s). |
 | `ATTPATT_V100_GEMM=1` | Unquantized linear layers of the Qwen3-4B qkv (K=2560, N=6144) and down (K=9728, N=2560) shapes use a cuBLASLt algorithm chosen per (M, N, K) for every CUDA graph capture size (`vllm/attpatt_v100/gemm.py`), registered as a custom op; every other layer and shape runs `F.linear`. The switch is part of the torch.compile cache key. |
@@ -28,6 +29,11 @@ Only the value `1` turns a switch on. Conditions for the decode kernel: fp16 KV 
 quantisation / multimodal prefix ranges / R-SWA; anything else runs the stock kernel.  v0.33 stores K and V of a
 token in one cache row (`[blocks, kv_heads, page, 2 * 128]`); the backend passes strided `[blocks, page, kv_heads,
 128]` views and the kernels read through the strides.
+
+
+## Long-context release v0.33.0-v100.3
+
+On one V100-SXM2-32GB, Qwen3-4B, four synthetic 32k contexts, fp16, original sampling and a 32768 generation cap: two 45-second decode windows per variant, with reversed order, measured 80.03 / 80.04 generated token/s original and 97.55 / 97.53 cooperative (about +21.9%). The first measured busy mean power was 233.3 -> 266.6 W. These are synthetic performance probes, not task accuracy results. Both variants captured graph sizes [1,2,4]; running production jobs are not modified. QK changes floating-point reduction order; bitwise parity with the original is not promised. Keep `ATTPATT_V100_QK_GROUP=1` as the rollback path.
 
 ## GEMM table
 

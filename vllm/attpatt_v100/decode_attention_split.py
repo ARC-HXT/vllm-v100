@@ -8,7 +8,8 @@ Design:
   partitions past a sequence's length exit at once, so the grid can be sized from the block table capacity and stays
   fixed under CUDA graphs.  One block serves the G=4 query heads of its KV head (GQA: K/V read once, as in the current
   kernel; v2 serves one query head per block and relies on L2 for the other three).
-- QK: one thread per token reads the token's 256-byte K row as 16 x 16-byte vectors straight into registers and does
+- QK: by default, 8 threads cooperate on each token and reduce each of its four query-head scores.
+  ATTPATT_V100_QK_GROUP=1 retains the original implementation: one thread per token reads the token's 256-byte K row as 16 x 16-byte vectors straight into registers and does
   the 4-head dot product itself (q in shared memory, broadcast reads), 4 tokens per thread, scores kept in registers.
 - PV: 16 threads cover one V row with one 16-byte vector each (8 rows per block step), UNROLL rows per thread are
   loaded before any is used, so each thread has UNROLL 16-byte reads in flight (TensorRT-LLM
@@ -22,12 +23,17 @@ Design:
   it when its metadata builder is created); never allocated while capturing and never moved after a capture used it;
   batches with more rows than the buffer holds run in row chunks.
 fp16 KV only (no fp8).  usage: from vllm.attpatt_v100.decode_attention_split import decode_attention, reserve"""
+import os
 import sys
 
 import torch
 
 PART, D = 512, 128
 UNROLL = 8  # PV 16-byte loads in flight per thread (2, 4 or 8 compiled; 8 fastest in the AttPatt benchmark)
+
+QK_GROUP = int(os.environ.get("ATTPATT_V100_QK_GROUP", "8"))
+if QK_GROUP not in (1, 8):
+    raise ValueError("ATTPATT_V100_QK_GROUP must be 1 (original) or 8 (cooperative)")
 
 _SRC = r"""
 #include <torch/extension.h>
@@ -92,6 +98,7 @@ __global__ void __launch_bounds__(NT) split_kernel(
   for (int i = tid; i < np; i += NT) blk[i] = btrow[p0 + i];
   __syncthreads();
 
+#if ATTPATT_V100_QK_GROUP == 1
   // QK: one thread per token, scores stay in registers
   float s[TPT][G], mx[G];
 #pragma unroll
@@ -124,6 +131,52 @@ __global__ void __launch_bounds__(NT) split_kernel(
       for (int g = 0; g < G; ++g) { s[k][g] = a[g]; mx[g] = fmaxf(mx[g], a[g]); }
     }
   }
+#else
+
+  // TensorRT-LLM threads_per_key pattern: adjacent lanes load adjacent columns.
+  // One group still computes all G query heads, preserving GQA K reuse.
+  constexpr int TG = 8, NG = NT / TG;
+  static_assert(32 % TG == 0 && (D / VEC) % TG == 0, "QK group must tile a warp and K row");
+  const int gl = tid % TG, gi = tid / TG;
+  const unsigned group_mask = ((1u << TG) - 1u) << ((tid % 32) / TG * TG);
+  for (int t = gi; t < n; t += NG) {
+    const int tok = start + t;
+    const uint4* kp = reinterpret_cast<const uint4*>(
+        kc + (long)blk[tok / page - p0] * s_kb + (long)(tok % page) * s_kp + (long)h * s_kh);
+    float a[G] = {0.f, 0.f, 0.f, 0.f};
+    #pragma unroll
+    for (int j = gl; j < D / VEC; j += TG) {
+      const uint4 raw = __ldg(kp + j);
+      const half2* hv = reinterpret_cast<const half2*>(&raw);
+      #pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        const float2 f = __half22float2(hv[e]);
+        const int d = j * VEC + e * 2;
+        #pragma unroll
+        for (int g = 0; g < G; ++g) a[g] += qs[g][d] * f.x + qs[g][d+1] * f.y;
+      }
+    }
+    #pragma unroll
+    for (int mask = TG / 2; mask; mask /= 2) {
+      #pragma unroll
+      for (int g = 0; g < G; ++g) a[g] += __shfl_xor_sync(group_mask, a[g], mask, TG);
+    }
+    if (gl == 0) reinterpret_cast<float4*>(pbuf)[t] = make_float4(a[0],a[1],a[2],a[3]);
+  }
+  __syncthreads();
+  float s[TPT][G], mx[G];
+  #pragma unroll
+  for (int g = 0; g < G; ++g) mx[g] = -FLT_MAX;
+  #pragma unroll
+  for (int k = 0; k < TPT; ++k) {
+    const int t = tid + k * NT;
+    #pragma unroll
+    for (int g = 0; g < G; ++g) {
+      s[k][g] = t < n ? pbuf[t*G+g] : -FLT_MAX;
+      mx[g] = fmaxf(mx[g], s[k][g]);
+    }
+  }
+#endif
   // partition max per head
 #pragma unroll
   for (int g = 0; g < G; ++g) {
@@ -369,8 +422,8 @@ def _load():
     global _mod
     if _mod is None:
         from torch.utils.cpp_extension import load_inline
-        _mod = load_inline("attpatt_v100_decode_split", cpp_sources=_CPP, cuda_sources=_SRC, functions=["decode"],
-                           extra_cuda_cflags=["-O3", "-gencode=arch=compute_70,code=sm_70", "--use_fast_math"],
+        _mod = load_inline(f"attpatt_v100_decode_split_v3_qk{QK_GROUP}", cpp_sources=_CPP, cuda_sources=_SRC, functions=["decode"],
+                           extra_cuda_cflags=[f"-DATTPATT_V100_QK_GROUP={QK_GROUP}", "-O3", "-gencode=arch=compute_70,code=sm_70", "--use_fast_math"],
                            verbose=False)
     return _mod
 
