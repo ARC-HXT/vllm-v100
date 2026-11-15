@@ -21,7 +21,7 @@ TEST_MS = [1, 2, 8, 64, 128, 168, 176, 184, 192, 256, 512]  # capture sizes incl
 @pytest.fixture(scope="module", autouse=True)
 def table():
     """select the TEST_MS entries missing from the cache (the engine itself never selects), then load the table"""
-    G.build(torch.device("cuda", 0), ms=TEST_MS)
+    G.build(torch.device("cuda", 0), shapes=[QKV, DOWN], ms=TEST_MS)
     G.prepare(torch.device("cuda", 0))
     yield
     torch.cuda.synchronize()
