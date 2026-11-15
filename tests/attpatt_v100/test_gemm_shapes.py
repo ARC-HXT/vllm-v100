@@ -13,7 +13,7 @@ torch = pytest.importorskip("torch")
 if not torch.cuda.is_available():
     pytest.skip("needs the CUDA platform (V100 box)", allow_module_level=True)
 
-H, HEADS, KV, D, FF, VOCAB = 256, 4, 2, 64, 512, 1000
+H, HEADS, KV, D, FF, VOCAB = 256, 4, 2, 64, 512, 1500  # padded vocab 1536: no clash with another shape
 
 
 def _model_dir(tmp_path_factory, name, cfg):
@@ -91,9 +91,10 @@ import vllm.model_executor.model_loader.utils as U
 from vllm.attpatt_v100 import gemm_shapes as S
 orig = U.initialize_model
 def renamed(**kw):
-    # qwen2 ties lm_head = model.embed_tokens; drop the embed_tokens name so the shared embedding is only reachable
-    # under another name, as GPT-2's wte or Falcon's word_embeddings are
+    # the head becomes the input embedding module itself, reachable only under a name other than embed_tokens (models
+    # that set lm_head = <embedding> and read logits through it, under names like wte / word_embeddings)
     net = orig(**kw)
+    net.lm_head = net.model.embed_tokens
     del net.model._modules["embed_tokens"]
     assert type(net.lm_head).__name__ == "VocabParallelEmbedding"
     return net
