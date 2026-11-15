@@ -4,16 +4,15 @@ functions of the layer geometry and the batch, no CUDA, so the rules are unit-te
 
 Two independent decisions (plan 2026-11-16 round 1 item 4; before, the prefill branch sat inside the decode condition
 and so required G4, D128 and no window):
-Layers with chunked attention (chunk_lookback != -1, e.g. rnj1: the stock kernel's chunk mask, not a sliding window)
-are served by neither kernel.
 - decode_ok: the CUDA split / one-block decode kernel can serve the one-token rows (G = 4, a compiled head dim, causal
   sliding window only with the split kernel, no softcap / alibi / sinks);
 - prefill_ok: torch's cutlass memory-efficient attention (vllm/attpatt_v100/prefill_attention.py) can serve the prefill
-  rows: causal, head dim a multiple of 8, full or causal sliding window, no softcap / alibi / sinks (it has no softcap:
-  a softcap layer would be computed wrongly, silently).  The 1Cat flash-attention-v100 path keeps its old scope
-  (decode_ok, D128, no window).
-Per-call conditions (fp16 KV, no fused output quantization, no multimodal prefix ranges, no R-SWA) apply to both and
-are checked by the caller with call_ok.
+  rows: causal, head dim in PREFILL_CUTLASS_HEAD_DIMS, full or causal sliding window, no softcap / alibi / sinks (it has
+  no softcap: a softcap layer would be computed wrongly, silently).  The 1Cat flash-attention-v100 path keeps its old
+  scope (decode_ok, D128, no window).
+Layers with chunked attention (chunk_lookback != -1, e.g. rnj1: the stock kernel's chunk mask, not a sliding window)
+are served by neither kernel.  Per-call conditions (fp16 KV, no fused output quantization, no multimodal prefix
+ranges, no R-SWA) apply to both and are checked by the caller with call_ok.
 - prefill_kernel: cutlass or Triton for the prefill rows of one batch, from the head dim, the window and the batch's
   longest query chunk (constants below; a batch is decided as a whole by its longest chunk)."""
 

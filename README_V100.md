@@ -21,8 +21,8 @@ see Build below.  The decode kernels are compiled at run time with `torch.utils.
 | `ATTPATT_V100_SPLIT=1` (with `DECODE`) | The decode kernel is the split-KV version (`vllm/attpatt_v100/decode_attention_split.py`): partitions of 512 tokens plus a reduce kernel, so few long sequences still fill the GPU. Its fp32 scratch is reserved when the TRITON_ATTN metadata builder is created (before CUDA graph capture), outside `gpu_memory_utilization`: max_num_seqs x query heads x ceil(max_model_len / 512) x 130 x 4 bytes (about 136 MB for 256 sequences, 32 heads, 16k context). |
 | `ATTPATT_V100_QK_GROUP=8` (default inside `SPLIT`) | Eight threads cooperate on each K row, reuse it for four query heads, and reduce with a fixed subgroup mask. fp16 KV / fp32 accumulation, same 512-token partitions and CUDA graph buffers. `=1` restores the original one-thread-per-token QK. JIT module names include the group so compiled caches cannot collide. |
 | `ATTPATT_V100_MIXED=1` (with `DECODE`) | Mixed prefill + decode batches: the metadata builder asks the runner to put decode requests first; their rows use the CUDA decode kernel and only the prefill rows go to the Triton kernel. |
-| `ATTPATT_V100_PREFILL=2` (with `DECODE` + `MIXED`) | Prefill / recompute rows of mixed and prefill batches run on tensor cores through torch's cutlass memory-efficient attention (`torch.ops.aten._efficient_attention_forward`, sm70 kernels in libtorch; `vllm/attpatt_v100/prefill_attention.py`): per request, its KV pages are gathered through the block table (4 KiB per token) and GQA is a stride-0 broadcast, causal mask aligned bottom-right. Host lengths come from `seq_lens_cpu_upper_bound`, so the path is off with speculative decoding. V100, Qwen3-4B, 3 prompts of 30k tokens: 291 -> 2713 prompt tok/s; 2048-token chunk over 32k history 425.6 -> 34.6 ms (32.8 TF/s). `=1` uses the 1Cat-vLLM flash-attention-v100 paged prefill kernel instead (JIT from sources at `$ATTPATT_FA_V100_SRC`, not shipped; 1177 prompt tok/s). |
-| `ATTPATT_V100_GEMM=1` | Unquantized linear layers of the Qwen3-4B qkv (K=2560, N=6144) and down (K=9728, N=2560) shapes use a cuBLASLt algorithm chosen per (M, N, K) for every CUDA graph capture size (`vllm/attpatt_v100/gemm.py`), registered as a custom op; every other layer and shape runs `F.linear`. The switch is part of the torch.compile cache key. |
+| `ATTPATT_V100_PREFILL=2` (with `DECODE` + `MIXED`) | Prefill / recompute rows of mixed and prefill batches run on tensor cores through torch's cutlass memory-efficient attention (`torch.ops.aten._efficient_attention_forward`, sm70 kernels in libtorch; `vllm/attpatt_v100/prefill_attention.py`): per request, its KV pages are gathered through the block table (4 KiB per token) and GQA is a stride-0 broadcast, causal mask aligned bottom-right. Host lengths come from `seq_lens_cpu_upper_bound`, so the path is off with speculative decoding. Decided per layer, independently of the decode kernel (`vllm/attpatt_v100/dispatch.py`): head dims 64, 80, 96, 128, 256 and 512, full attention or a causal sliding window; layers with soft cap, ALiBi, sinks or chunked attention (`chunk_lookback`) stay on the Triton kernel. Per batch, by its longest query chunk: fewer than 512 (D64), 128 (D80 / D96 / D128), 256 (D256) query tokens run on Triton, D512 always on cutlass; with a window of at most 1024 tokens, every batch at D >= 256 and, at smaller D, every batch whose longest chunk is shorter than twice the window run on Triton. V100, Qwen3-4B, 3 prompts of 30k tokens: 291 -> 2713 prompt tok/s; 2048-token chunk over 32k history 425.6 -> 34.6 ms (32.8 TF/s). `=1` uses the 1Cat-vLLM flash-attention-v100 paged prefill kernel instead (JIT from sources at `$ATTPATT_FA_V100_SRC`, not shipped; 1177 prompt tok/s), only for layers the decode kernel serves, D128, no window. |
+| `ATTPATT_V100_GEMM=1` | Unquantized fp16 linear layers and logits heads whose shape (K, N, bias) is in the offline-built table use a cuBLASLt algorithm chosen per (M, N, K, bias) for every CUDA graph capture size (`vllm/attpatt_v100/gemm.py`), registered as a custom op; layers with a bias use the cuBLASLt bias epilogue. The table is built per model and tensor-parallel size with `gemm build --model <dir> --tp N` (see GEMM table below; catalogue format version 2). Every other layer and shape runs `F.linear`. The switch and the catalogue's shape digest are part of the torch.compile cache key. |
 
 The on/off switches use `1`; `PREFILL` also accepts `2`, and `QK_GROUP` is a selector accepting `1` or `8`.
 Set variables before worker startup. Use a release-specific `TORCH_EXTENSIONS_DIR` and precompile both QK groups
@@ -40,18 +40,27 @@ On one V100-SXM2-32GB, Qwen3-4B, four synthetic 32k contexts, fp16, original sam
 
 ## GEMM table
 
-The engine never selects algorithms; it only loads the table. Build it once per GPU model / cuBLASLt / torch
-version (about 6 minutes on a V100, one GPU):
+The engine never selects algorithms; it only loads the table. Build it offline, once per GPU model / cuBLASLt / torch
+version, for the models and tensor-parallel sizes that will be served; the shapes (rank-0 shards, bias flags, logits
+head) are enumerated from the model config on the meta device, without a GPU or weights:
 
 ```bash
+# once after installing a new release: takes over the previous release's table in the same directory (its no-bias
+# records and shapes) and selects whatever is missing of the legacy Qwen3-4B and catalogued shapes (about 6 minutes on
+# a V100 when nothing can be taken over)
 CUDA_VISIBLE_DEVICES=<gpu> python -m vllm.attpatt_v100.gemm build
+# then per model and tensor-parallel size; several builders, one per GPU, may share one cache directory
+CUDA_VISIBLE_DEVICES=<gpu> python -m vllm.attpatt_v100.gemm build --model <model dir> --tp <N>
 ```
 
-The file goes to `$ATTPATT_V100_GEMM_CACHE` (default `$VLLM_CACHE_ROOT/attpatt_v100_gemm`, i.e.
-`~/.cache/vllm/attpatt_v100_gemm`). Without it, `ATTPATT_V100_GEMM=1` logs one line and runs `F.linear` everywhere.
+The files go to `$ATTPATT_V100_GEMM_CACHE` (default `$VLLM_CACHE_ROOT/attpatt_v100_gemm`, i.e.
+`~/.cache/vllm/attpatt_v100_gemm`): the algorithm records and `shapes.json`, the catalogue of shapes with an accepted
+record (format version 2, shapes (K, N, bias); a version-1 catalogue of v100.7 and earlier is ignored). Without them,
+`ATTPATT_V100_GEMM=1` logs one line and runs `F.linear` everywhere.
 An entry is kept only if it was at least 3 % faster than `F.linear` in an interleaved re-measurement and its max-abs
-and RMS errors against an fp32 reference were not worse (split-K only with fp32 partial sums); operands that are not
-256-byte aligned, non-contiguous inputs, bias, other dtypes and sizes outside the table fall back to `F.linear`.
+and RMS errors against an fp32 reference were not worse (split-K only with fp32 partial sums; bias entries are
+compared with `F.linear(x, w, b)`); operands or a bias that are not 256-byte aligned, non-contiguous inputs, other
+dtypes and sizes outside the table fall back to `F.linear`.
 Measured on V100 at the profiled production batch (graph sizes 168 / 176 / 184): qkv about 15 % and down about 8 %
 faster; at batch 256 neither shape gains and both fall back.
 
@@ -124,5 +133,5 @@ skipped there.
 
 - sm70 / fp16 only; the kernels are not tuned or tested on other GPUs.
 - GEMM: one cuBLASLt workspace per device, shared by all table GEMMs; this assumes they run on one stream (true for
-  vLLM's dense decoder models). Only the two Qwen3-4B shapes are in the table.
+  vLLM's dense decoder models). Only shapes built offline (plus the two legacy Qwen3-4B shapes) are in the table.
 - Split-KV scratch is allocated outside `gpu_memory_utilization` (see the table above).
