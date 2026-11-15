@@ -55,7 +55,23 @@ and RMS errors against an fp32 reference were not worse (split-K only with fp32 
 Measured on V100 at the profiled production batch (graph sizes 168 / 176 / 184): qkv about 15 % and down about 8 %
 faster; at batch 256 neither shape gains and both fall back.
 
-## Build (sm70 only, from source)
+## Build and artifacts (GitHub Actions)
+
+`.github/workflows/attpatt-v100-wheel.yml` builds the complete CUDA wheel from
+the checked-out source on a GitHub-hosted runner: Python3.13, CUDA12.8.1,
+Torch2.14.0+cu126, and SM70 only. It does not reuse or repack an older vLLM
+wheel. Pushes to `main`, `v100-*` and `codex/v100-*`, or a manual dispatch,
+produce a wheel, SHA256 checksums, source/run provenance, native SM70
+verification and CPU test results as one Actions artifact. Native compilation
+and the separate CPU workflow can run concurrently. V100 kernel/model tests
+require a real GPU and are a separate acceptance step; a hosted CPU runner
+does not establish GPU correctness or performance.
+
+Build environments live only on disposable Actions runners. Do not accumulate
+versioned build virtual environments on inference servers. Install a verified
+CI artifact for runtime use; GPU acceptance must use that exact artifact.
+
+## Reproduce the Actions build (sm70 only)
 
 Tested on Ubuntu 22.04, GCC 11.4, CUDA 12.8 toolkit, driver 580, Python 3.13:
 

@@ -1,0 +1,95 @@
+name: V100 full CUDA wheel
+
+on:
+  push:
+    branches: ['main', 'v100-*', 'codex/v100-*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v100-wheel-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wheel:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      VLLM_TARGET_DEVICE: cuda
+      TORCH_CUDA_ARCH_LIST: '7.0'
+      VLLM_VERSION_OVERRIDE: 0.33.0+v100.7
+      VLLM_USE_PRECOMPILED: '0'
+      MAX_JOBS: '2'
+      NVCC_THREADS: '1'
+      CARGO_BUILD_JOBS: '2'
+      CCACHE_MAXSIZE: 1G
+      UV_NO_CACHE: '1'
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Make room on this disposable runner
+        run: |
+          for path in /usr/local/lib/android /usr/share/dotnet /opt/ghc; do
+            if test -d "$path"; then sudo rm -r -- "$path"; fi
+          done
+          df -h /
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ccache libnuma-dev
+
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          python-version: '3.13'
+
+      - uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+        id: cuda
+        with:
+          cuda: '12.8.1'
+          linux-local-args: '["--toolkit"]'
+          use-github-cache: 'false'
+
+      - name: Install the pinned compiler dependencies
+        run: |
+          uv venv
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+          echo "CUDA_HOME=${{ steps.cuda.outputs.CUDA_PATH }}" >> "$GITHUB_ENV"
+          uv pip install 'torch==2.14.0+cu126' --index-url https://download.pytorch.org/whl/cu126
+          uv pip install -r requirements/build/cuda.txt --extra-index-url https://download.pytorch.org/whl/cu126 --index-strategy unsafe-best-match
+          nvcc --version
+
+      - name: Compile the complete wheel from this checkout
+        run: |
+          mkdir -p dist
+          python -m build --wheel --no-isolation --skip-dependency-check . 2>&1 | tee dist/build.log
+          ccache --show-stats
+
+      - name: Verify native SM70 code and record provenance
+        run: |
+          wheel=$(find dist -maxdepth 1 -name '*.whl' -print -quit)
+          test -n "$wheel"
+          python -m zipfile -e "$wheel" "$RUNNER_TEMP/v100-wheel-unpack"
+          grep -Fx "Version: $VLLM_VERSION_OVERRIDE" "$RUNNER_TEMP/v100-wheel-unpack/vllm-$VLLM_VERSION_OVERRIDE.dist-info/METADATA"
+          cuobjdump --list-elf "$RUNNER_TEMP/v100-wheel-unpack/vllm/_C.abi3.so" > dist/sm70-elf.txt
+          grep 'sm_70' dist/sm70-elf.txt
+          python -c 'import json,os,sys,torch; print(json.dumps(dict(commit=os.environ["GITHUB_SHA"], run_id=os.environ["GITHUB_RUN_ID"], version=os.environ["VLLM_VERSION_OVERRIDE"], python=sys.version, torch=torch.__version__, torch_cuda=torch.version.cuda, architecture=os.environ["TORCH_CUDA_ARCH_LIST"], source_build=True),indent=2))' > dist/build-info.json
+          nvcc --version > dist/nvcc.txt
+          sha256sum dist/*.whl > dist/SHA256SUMS
+
+      - name: Check the installed artifact on CPU
+        run: |
+          wheel=$(find dist -maxdepth 1 -name '*.whl' -print -quit)
+          uv pip install "$wheel" pytest --extra-index-url https://download.pytorch.org/whl/cu126 --index-strategy unsafe-best-match
+          mkdir -p "$RUNNER_TEMP/v100-wheel-tests"
+          cp -r tests/attpatt_v100 "$RUNNER_TEMP/v100-wheel-tests/"
+          cd "$RUNNER_TEMP/v100-wheel-tests"
+          python -c 'import os,vllm; assert vllm.__version__ == os.environ["VLLM_VERSION_OVERRIDE"]; print(vllm.__version__,vllm.__file__)'
+          python -m pytest --noconftest -q -rs attpatt_v100/test_switches.py --junitxml="$GITHUB_WORKSPACE/dist/cpu-tests.xml"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: vllm-v100-sm70-cp313-${{ github.sha }}
+          path: dist/
+          if-no-files-found: warn
+          retention-days: 14
