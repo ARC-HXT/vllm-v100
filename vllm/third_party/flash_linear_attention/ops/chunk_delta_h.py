@@ -14,7 +14,7 @@ from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices, prepare_chunk_offsets
 from .op import exp, exp2
-from .utils import FLA_CHUNK_SIZE, use_cuda_graph
+from .utils import FLA_CHUNK_SIZE, get_autotune_num_stages, use_cuda_graph
 
 NUM_WARPS = [2, 4, 8, 16]
 # Triton's AMD backend fails to lower this kernel with num_stages=4.
@@ -35,7 +35,7 @@ _CHUNK_DELTA_H_NUM_STAGES = [2, 3] if torch.version.hip else [2, 3, 4]
     configs=[
         triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4]
-        for num_stages in _CHUNK_DELTA_H_NUM_STAGES
+        for num_stages in get_autotune_num_stages(_CHUNK_DELTA_H_NUM_STAGES)
         for BV in [32, 64]
     ],
     key=["H", "K", "V", "BT"],

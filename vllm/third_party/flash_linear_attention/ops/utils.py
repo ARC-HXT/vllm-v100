@@ -153,6 +153,21 @@ is_nvidia_hopper = is_nvidia and (
     or torch.cuda.get_device_capability()[0] >= 9
 )
 use_cuda_graph = is_nvidia and os.environ.get("FLA_USE_CUDA_GRAPH", "0") == "1"
+
+
+def get_autotune_num_stages(stages: list[int]) -> list[int]:
+    """Avoid compiling duplicate pipeline-stage variants on Volta.
+
+    Triton's NVIDIA backend skips the num_stages-dependent scheduling and
+    pipeline passes on SM70. Its different stage options therefore produce
+    identical PTX/cubins, but still incur separate LLVM compilations. Keep
+    all tile/warp choices and the original search space on other devices.
+    """
+    if is_nvidia and torch.cuda.get_device_capability() == (7, 0):
+        return stages[:1]
+    return stages
+
+
 is_gather_supported = hasattr(triton.language, "gather")
 is_tma_supported = (
     is_nvidia_hopper

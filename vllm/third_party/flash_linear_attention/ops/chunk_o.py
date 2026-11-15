@@ -16,7 +16,12 @@ from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
 from .op import exp
-from .utils import FLA_CHUNK_SIZE, check_shared_mem, is_nvidia_hopper
+from .utils import (
+    FLA_CHUNK_SIZE,
+    check_shared_mem,
+    get_autotune_num_stages,
+    is_nvidia_hopper,
+)
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
@@ -34,7 +39,7 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
         for BK in BKV_LIST
         for BV in BKV_LIST
         for num_warps in NUM_WARPS
-        for num_stages in [2, 3, 4]
+        for num_stages in get_autotune_num_stages([2, 3, 4])
     ],
     key=["H", "K", "V", "BT"],
 )
