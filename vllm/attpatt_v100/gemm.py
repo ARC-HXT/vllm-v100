@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""cuBLASLt algorithm table for the fp16 linear layers of Qwen3-4B on V100, enabled by ATTPATT_V100_GEMM=1
+"""cuBLASLt algorithm table for offline-validated fp16 linear shapes on V100.
+Enabled by ATTPATT_V100_GEMM=1.
 (vllm/model_executor/layers/utils.py dispatch_unquantized_gemm registers gemm() as a custom op and returns linear()).
 
 Why: in a profiled production run (decode batches of 166-178 tokens -> graph sizes 168 / 176 / 184) cuBLAS picks
@@ -18,7 +19,8 @@ Rules:
   split-K only with fp32 partial sums; otherwise the entry is None;
 - anything outside the table (other M, other shapes, bias, non-fp16, non-contiguous input, an operand not 256-byte
   aligned, entry None, table not ready under capture) runs F.linear itself, so it is bitwise the stock path.
-Scope: ON_SHAPES = Qwen3-4B qkv and down only; every other linear layer runs F.linear.
+Scope: legacy Qwen3-4B qkv/down plus accepted offline shapes in shapes.json.
+Each (M, N, K) needs a matching device/version record; otherwise it runs F.linear.
 Cache directory: $ATTPATT_V100_GEMM_CACHE, default $VLLM_CACHE_ROOT/attpatt_v100_gemm (~/.cache/vllm/attpatt_v100_gemm).
 CLI: python -m vllm.attpatt_v100.gemm build   (fills the cache for all ON_SHAPES x CAPTURE_MS on cuda:0, about 6 min
 on a V100; one JSON line per entry)"""
@@ -31,8 +33,13 @@ import torch
 import torch.nn.functional as F
 
 from vllm.attpatt_v100 import gemm_lt as lt
+from vllm.attpatt_v100.gemm_catalog import (
+    configured_shapes,
+    default_cache_dir,
+    write_catalogue,
+)
 
-ON_SHAPES = ((2560, 6144), (9728, 2560))  # (K, N): Qwen3-4B qkv_proj, down_proj
+ON_SHAPES = configured_shapes()  # (K, N), legacy plus offline-accepted shapes
 # vLLM 0.19 default capture sizes when max_cudagraph_capture_size = 512 (vllm/config/vllm.py:1418-1443;
 # max = min(max_num_seqs * 2, 512) = 512 for the production max_num_seqs 256)
 CAPTURE_MS = [1, 2, 4] + list(range(8, 256, 8)) + list(range(256, 513, 16))
@@ -43,8 +50,7 @@ FINAL = 3  # candidates in the interleaved re-measurement against F.linear
 ROUNDS = 15
 POLICY = "fp32red_rms"  # candidate policy, part of the cache file name (see _fp32_partials, _not_worse)
 ALIGN = 256  # bytes, for x, weight and y (see gemm)
-CACHE_DIR = os.environ.get("ATTPATT_V100_GEMM_CACHE") or os.path.join(
-    os.path.expanduser(os.environ.get("VLLM_CACHE_ROOT", os.path.join("~", ".cache", "vllm"))), "attpatt_v100_gemm")
+CACHE_DIR = default_cache_dir()
 
 _table = {}  # (device index, M, N, K) -> CPU int64 row (16) or None
 _ready = set()  # device indices whose table is loaded / built for ON_SHAPES
@@ -219,6 +225,10 @@ def build(dev, shapes=ON_SHAPES, ms=CAPTURE_MS, cache_dir=None, select=True):
             out[(M, N, K)] = recs[(M, N, K)]
     if dirty:
         _log(f"selected missing entries in {time.time() - t0:.0f} s -> {path}")
+    if select:
+        # Engines never select or update dispatch. A fresh worker reads this
+        # static catalogue; algorithm rows still use the device/version key.
+        write_catalogue(recs, cache_dir or CACHE_DIR)
     if missing:
         _log(f"{missing} (M, N, K) entries missing from {path} -> F.linear for them "
              f"(build the table with: python -m vllm.attpatt_v100.gemm build)")

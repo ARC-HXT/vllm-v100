@@ -164,7 +164,7 @@ def test_cache_file_round_trip(tmp_path, monkeypatch):
     K, N = QKV
     dev = torch.device("cuda", 0)
     rows = G.build(dev, [(K, N)], [8, 176], cache_dir=str(tmp_path))
-    assert len(list(tmp_path.iterdir())) == 1
+    assert len(list(tmp_path.iterdir())) == 2  # records and shape catalogue
     monkeypatch.setattr(G, "_select", lambda *a, **k: (_ for _ in ()).throw(AssertionError("not from cache")))
     again = G.build(dev, [(K, N)], [8, 176], cache_dir=str(tmp_path))
     assert {k: (None if v is None else v["row"]) for k, v in rows.items()} == \

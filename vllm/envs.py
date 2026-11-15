@@ -2467,8 +2467,12 @@ def compile_factors() -> dict[str, object]:
             continue
 
         factors[factor] = normalize_value(raw)
-    if os.environ.get("ATTPATT_V100_GEMM") == "1":  # attpatt V100 GEMM patch: the switch joins the compile cache key
+    # AttPatt GEMM static dispatch joins the compilation cache key.
+    if os.environ.get("ATTPATT_V100_GEMM") == "1":
+        from vllm.attpatt_v100.gemm_catalog import fingerprint
+
         factors["ATTPATT_V100_GEMM"] = "1"
+        factors["ATTPATT_V100_GEMM_SHAPES"] = fingerprint()
 
     ray_noset_env_vars = [
         # Refer to
