@@ -57,6 +57,9 @@ envs = load_module_from_path("envs", os.path.join(ROOT_DIR, "vllm", "envs.py"))
 rust_build = load_module_from_path(
     "rust_build", os.path.join(ROOT_DIR, "tools", "build_rust.py")
 )
+cuda_arch_targets = load_module_from_path(
+    "cuda_arch_targets", os.path.join(ROOT_DIR, "tools", "cuda_arch_targets.py")
+)
 
 VLLM_TARGET_DEVICE = envs.VLLM_TARGET_DEVICE
 USE_PRECOMPILED_EXTENSIONS = envs.VLLM_USE_PRECOMPILED
@@ -1562,9 +1565,17 @@ if _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
 
 if _is_cuda():
-    ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
-    if USE_PRECOMPILED_EXTENSIONS or (
-        CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
+    # vllm-v100: a Volta / Turing-only arch list skips the FA2 / FA3 kernels (no
+    # usable arch, tools/cuda_arch_targets.py); their Python files still install
+    # through the FA4 CuteDSL component (cmake/external_projects/vllm_flash_attn.cmake).
+    build_fa_kernels = USE_PRECOMPILED_EXTENSIONS or (
+        cuda_arch_targets.builds_sm80_or_newer(os.getenv("TORCH_CUDA_ARCH_LIST"))
+    )
+    if build_fa_kernels:
+        ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
+    if build_fa_kernels and (
+        USE_PRECOMPILED_EXTENSIONS
+        or (CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3"))
     ):
         # FA3 requires CUDA 12.3 or later
         ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))
@@ -1628,7 +1639,8 @@ package_data = {
         "entrypoints/serve/instrumentator/static/*.js",
         "entrypoints/serve/instrumentator/static/*.css",
         "distributed/kv_transfer/kv_connector/v1/hf3fs/utils/*.cpp",
-        # V100 prefill switch =1: pybind source of the JIT-built flash-attention-v100 binding
+        # V100 prefill switch =1: pybind source of the JIT-built
+        # flash-attention-v100 binding
         "attpatt_v100/*.cpp",
         # Built-in multimodal chat template fallbacks (registry.py)
         "transformers_utils/chat_templates/*.jinja",

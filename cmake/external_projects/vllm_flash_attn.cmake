@@ -62,7 +62,10 @@ install(CODE "set(CMAKE_INSTALL_PREFIX \"\${OLD_CMAKE_INSTALL_PREFIX}\")" ALL_CO
 install(CODE "set(CMAKE_INSTALL_LOCAL_ONLY TRUE)" ALL_COMPONENTS)
 
 # Install shared Python files for both FA2 and FA3 components
-foreach(_FA_COMPONENT _vllm_fa2_C _vllm_fa3_C)
+# vllm-v100: and for the Python-only FA4 CuteDSL component, which setup.py always
+# installs. Volta / Turing-only builds skip FA2 / FA3 (setup.py) but still need these
+# files, e.g. layers/rotary.py (RotaryEmbedding.forward_cuda).
+foreach(_FA_COMPONENT _vllm_fa2_C _vllm_fa3_C _vllm_fa4_cutedsl_C)
   # Ensure the vllm/vllm_flash_attn directory exists before installation
   install(CODE "file(MAKE_DIRECTORY \"\${CMAKE_INSTALL_PREFIX}/vllm/vllm_flash_attn\")"
     COMPONENT ${_FA_COMPONENT})
