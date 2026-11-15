@@ -47,8 +47,10 @@ from vllm.v1.attention.ops.triton_unified_attention import (
 import os as _os
 _attpatt_v100_decode = None
 _attpatt_v100_reserve = None
+_attpatt_decode_dims = (128,)
 if _os.environ.get("ATTPATT_V100_DECODE") == "1":  # attpatt V100 decode patch
     if _os.environ.get("ATTPATT_V100_SPLIT") == "1":  # attpatt V100 decode patch: split-KV kernel
+        from vllm.attpatt_v100.decode_attention_split import SUPPORTED_HEAD_DIMS as _attpatt_decode_dims
         from vllm.attpatt_v100.decode_attention_split import _load as _attpatt_load, decode_attention as _attpatt_v100_decode
         from vllm.attpatt_v100.decode_attention_split import reserve as _attpatt_v100_reserve
     else:
@@ -144,7 +146,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         self.headdim = model_config.get_head_size()
         if _attpatt_v100_reserve is not None:  # attpatt V100 decode patch: split-KV scratch, before graph capture
             _attpatt_v100_reserve(device, vllm_config.scheduler_config.max_num_seqs, self.num_heads_q,
-                                  model_config.max_model_len, self.block_size)
+                                  model_config.max_model_len, self.block_size, head_dim=self.headdim)
 
         # Check if CUDA Graphs are enabled for decode
         self.decode_cudagraph_enabled = (
@@ -733,7 +735,7 @@ class TritonAttentionImpl(AttentionImpl):
                 key_cache.dtype == torch.float16 and self.alibi_slopes is None
                 and tuple(self.sliding_window) == (-1, -1) and not self.logits_soft_cap and self.sinks is None
                 and output_scale is None and mm_prefix_range_tensor is None and attn_metadata.rswa_window is None
-                and query.shape[2] == 128 and query.shape[1] == 4 * key_cache.shape[2]):
+                and query.shape[2] in _attpatt_decode_dims and query.shape[1] == 4 * key_cache.shape[2]):
             # v0.33 KV layout: key_cache / value_cache are strided views [blocks, page, kv_heads, 128] of the
             # [blocks, kv_heads, page, 2 * 128] cache (the kernel takes strides; head_dim stays contiguous)
             if max_seqlen_q == 1:
@@ -742,7 +744,8 @@ class TritonAttentionImpl(AttentionImpl):
                 return output
             nd = getattr(attn_metadata, "attpatt_num_decodes", 0)
             seq_lens_cpu = getattr(attn_metadata, "attpatt_seq_lens_cpu", None)
-            if _attpatt_prefill is not None and seq_lens_cpu is not None and attn_metadata.causal:
+            if (_attpatt_prefill is not None and seq_lens_cpu is not None and attn_metadata.causal
+                    and query.shape[2] == 128):
                 # attpatt V100 prefill patch: decode rows on the CUDA decode kernel, prefill rows on tensor cores
                 qsl_cpu = attn_metadata.attpatt_qsl_cpu
                 if nd > 0:

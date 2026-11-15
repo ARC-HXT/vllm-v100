@@ -5,7 +5,8 @@ import torch
 HQ, HKV, D, PAGE, CAP = 32, 8, 128, 16, 16384  # Qwen3-4B heads; block table sized for max_model_len 16384 (32 parts)
 
 
-def make_batch(lens, seed, cap=CAP, page=PAGE, pool=None):
+def make_batch(lens, seed, cap=CAP, page=PAGE, pool=None,
+               head_dim=D, num_q_heads=HQ, num_kv_heads=HKV):
     """Paged fp16 KV in vLLM's flash layout [blocks, page, kv_heads, 128]; every sequence gets physical blocks drawn
     from one random permutation (non-contiguous), block table columns past a sequence's length point at block 0.
     pool=N: only N physical blocks; each sequence draws its own distinct random blocks from them (sequences share
@@ -13,8 +14,8 @@ def make_batch(lens, seed, cap=CAP, page=PAGE, pool=None):
     g = torch.Generator(device="cpu").manual_seed(seed)
     nblk = [(n + page - 1) // page for n in lens]
     total = sum(nblk) + 1 if pool is None else pool + 1
-    kc = torch.randn(total, page, HKV, D, generator=g).half().cuda()
-    vc = torch.randn(total, page, HKV, D, generator=g).half().cuda()
+    kc = torch.randn(total, page, num_kv_heads, head_dim, generator=g).half().cuda()
+    vc = torch.randn(total, page, num_kv_heads, head_dim, generator=g).half().cuda()
     perm = (torch.randperm(total - 1, generator=g) + 1).tolist()
     bt = torch.zeros(len(lens), cap // page, dtype=torch.int32)
     i = 0
@@ -24,21 +25,26 @@ def make_batch(lens, seed, cap=CAP, page=PAGE, pool=None):
             continue
         bt[b, :nb] = torch.tensor(perm[i:i + nb], dtype=torch.int32)
         i += nb
-    q = torch.randn(len(lens), HQ, D, generator=g).half().cuda()
+    q = torch.randn(len(lens), num_q_heads, head_dim, generator=g).half().cuda()
     return q, kc, vc, bt.cuda(), torch.tensor(lens, dtype=torch.int32).cuda()
 
 
 def reference(q, kc, vc, bt, lens, scale):
     """fp32 attention of one query token per sequence over its paged KV, 4 query heads per KV head"""
     out = torch.empty(q.shape, dtype=torch.float32, device=q.device)
+    hq, d = q.shape[1:]
+    page, hkv = kc.shape[1:3]
     for b, n in enumerate(lens.tolist()):
-        nb = (n + PAGE - 1) // PAGE
+        if n == 0:
+            out[b].zero_()
+            continue
+        nb = (n + page - 1) // page
         blocks = bt[b, :nb].long()
-        k = kc[blocks].reshape(-1, HKV, D)[:n].float()
-        v = vc[blocks].reshape(-1, HKV, D)[:n].float()
-        qq = q[b].float().view(HKV, HQ // HKV, D)
+        k = kc[blocks].reshape(-1, hkv, d)[:n].float()
+        v = vc[blocks].reshape(-1, hkv, d)[:n].float()
+        qq = q[b].float().view(hkv, hq // hkv, d)
         s = torch.einsum("hgd,thd->hgt", qq, k) * scale
-        out[b] = torch.einsum("hgt,thd->hgd", s.softmax(-1), v).reshape(HQ, D)
+        out[b] = torch.einsum("hgt,thd->hgd", s.softmax(-1), v).reshape(hq, d)
     return out
 
 
