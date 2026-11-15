@@ -10,6 +10,8 @@ import shutil
 
 import pytest
 
+pytestmark = pytest.mark.cpu  # the switch-on cases skip without a GPU + nvcc (needs_cuda)
+
 SWITCHES = ("ATTPATT_V100_DECODE", "ATTPATT_V100_MIXED", "ATTPATT_V100_SPLIT", "ATTPATT_V100_GEMM",
             "ATTPATT_V100_PREFILL")
 

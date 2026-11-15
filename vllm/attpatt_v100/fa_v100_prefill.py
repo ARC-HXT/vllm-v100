@@ -18,17 +18,23 @@ def _load():
             raise RuntimeError("ATTPATT_V100_PREFILL=1 needs ATTPATT_FA_V100_SRC set to the flash-attention-v100 "
                                "source tree (include/, kernel/)")
         from torch.utils.cpp_extension import load
+
+        from vllm.attpatt_v100.jit import ext_name, file_bytes
         here = os.path.dirname(os.path.abspath(__file__))
+        sources = [os.path.join(here, "fa_v100_prefill_bind.cpp"),
+                   os.path.join(SRC, "kernel", "fused_mha_forward_paged.cu")]
+        cflags = ["-O3", "-std=c++20"]
+        cuda_cflags = ["-O3", "-std=c++20", "-gencode=arch=compute_70,code=sm_70",
+                       "-U__CUDA_NO_HALF_OPERATORS__", "-U__CUDA_NO_HALF_CONVERSIONS__",
+                       "-U__CUDA_NO_HALF2_OPERATORS__", "--expt-relaxed-constexpr",
+                       "--expt-extended-lambda", "--use_fast_math"]
+        # headers under include/ are not hashed: the 1Cat tree is pinned to one commit (module docstring)
         _ext = load(
-            name="attpatt_fa_v100_prefill",
-            sources=[os.path.join(here, "fa_v100_prefill_bind.cpp"),
-                     os.path.join(SRC, "kernel", "fused_mha_forward_paged.cu")],
+            name=ext_name("attpatt_fa_v100_prefill", file_bytes(*sources), cflags, cuda_cflags),
+            sources=sources,
             extra_include_paths=[os.path.join(SRC, "include"), os.path.join(SRC, "kernel")],
-            extra_cflags=["-O3", "-std=c++20"],
-            extra_cuda_cflags=["-O3", "-std=c++20", "-gencode=arch=compute_70,code=sm_70",
-                               "-U__CUDA_NO_HALF_OPERATORS__", "-U__CUDA_NO_HALF_CONVERSIONS__",
-                               "-U__CUDA_NO_HALF2_OPERATORS__", "--expt-relaxed-constexpr",
-                               "--expt-extended-lambda", "--use_fast_math"],
+            extra_cflags=cflags,
+            extra_cuda_cflags=cuda_cflags,
             verbose=False)
     return _ext
 

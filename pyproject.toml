@@ -131,6 +131,7 @@ markers = [
     "hybrid_model: models that contain mamba layers (including pure SSM and hybrid architectures)",
     "cpu_model: enable this model test in CPU tests",
     "cpu_test: mark test as CPU-only test",
+    "cpu: tests/attpatt_v100 test that runs on the CPU Actions job (attpatt-v100-cpu.yml)",
     "split: run this test as part of a split",
     "distributed: run this test only in distributed GPU tests",
     "optional: optional tests that are automatically skipped, include --optional to run them",

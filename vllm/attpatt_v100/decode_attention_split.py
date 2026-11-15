@@ -448,6 +448,18 @@ _scratch = {}   # device index -> flat fp32 buffer
 _locked = set()  # device indices whose buffer a CUDA graph has captured
 
 
+def _cuda_flags(head_dim, qk):
+    return [f"-DATTPATT_V100_QK_GROUP={qk}", f"-DATTPATT_V100_HEAD_DIM={head_dim}", "-O3",
+            "-gencode=arch=compute_70,code=sm_70", "--use_fast_math"]
+
+
+def jit_variants():
+    """(variant, CUDA source, nvcc flags) of every build, for the Actions register / spill / shared-memory matrix;
+    D512 has no one-thread-per-token QK variant"""
+    return [(f"d{d}_qk{qk}", _SRC, _cuda_flags(d, qk))
+            for d in SUPPORTED_HEAD_DIMS for qk in (1, 8) if d <= 256 or qk == 8]
+
+
 def _load(head_dim=128):
     if head_dim not in SUPPORTED_HEAD_DIMS:
         raise ValueError("split decode supports head dimensions 128, 256 and 512")
@@ -456,10 +468,13 @@ def _load(head_dim=128):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("call reserve() for the head dimension before CUDA graph capture")
         from torch.utils.cpp_extension import load_inline
+
+        from vllm.attpatt_v100.jit import ext_name
         qk = QK_GROUP if head_dim <= 256 else 8  # D512 has no one-thread-per-token QK variant
-        mod = load_inline(f"attpatt_v100_decode_split_v5_d{head_dim}_qk{qk}", cpp_sources=_CPP, cuda_sources=_SRC, functions=["decode"],
-                           extra_cuda_cflags=[f"-DATTPATT_V100_QK_GROUP={qk}", f"-DATTPATT_V100_HEAD_DIM={head_dim}", "-O3", "-gencode=arch=compute_70,code=sm_70", "--use_fast_math"],
-                           verbose=False)
+        flags = _cuda_flags(head_dim, qk)
+        mod = load_inline(ext_name(f"attpatt_v100_decode_split_d{head_dim}_qk{qk}", _CPP, _SRC, flags),
+                          cpp_sources=_CPP, cuda_sources=_SRC, functions=["decode"], extra_cuda_cflags=flags,
+                          verbose=False)
         _mods[head_dim] = mod
     return mod
 

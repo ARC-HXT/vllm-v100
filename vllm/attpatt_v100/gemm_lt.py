@@ -159,10 +159,14 @@ def _load():
     if _mod is None:
         from torch.utils.cpp_extension import load_inline
         import nvidia.cublas
+
+        from vllm.attpatt_v100.jit import ext_name
         lib = os.path.join(list(nvidia.cublas.__path__)[0], "lib")
-        _mod = load_inline("attpatt_v100_gemm_lt", cpp_sources=_CPP, functions=["heuristic", "enumerate", "matmul", "version", "prepare"],
-                           with_cuda=True, extra_cflags=["-O2"],
-                           extra_ldflags=[f"-L{lib}", "-l:libcublasLt.so.12", f"-Wl,-rpath,{lib}"], verbose=False)
+        functions = ["heuristic", "enumerate", "matmul", "version", "prepare"]
+        ldflags = [f"-L{lib}", "-l:libcublasLt.so.12", f"-Wl,-rpath,{lib}"]
+        _mod = load_inline(ext_name("attpatt_v100_gemm_lt", _CPP, functions, ldflags), cpp_sources=_CPP,
+                           functions=functions, with_cuda=True, extra_cflags=["-O2"], extra_ldflags=ldflags,
+                           verbose=False)
     return _mod
 
 

@@ -151,16 +151,23 @@ void decode(torch::Tensor out, torch::Tensor q, torch::Tensor kc, torch::Tensor 
 """
 _CPP = "void decode(torch::Tensor out, torch::Tensor q, torch::Tensor kc, torch::Tensor vc, torch::Tensor bt, " \
        "torch::Tensor lens, double scale);"
+_CUDA_FLAGS = ["-O3", "-gencode=arch=compute_70,code=sm_70", "--use_fast_math"]
 _mod = None
+
+
+def jit_variants():
+    """(variant, CUDA source, nvcc flags) of every build, for the Actions register / spill / shared-memory matrix"""
+    return [("decode", _SRC, _CUDA_FLAGS)]
 
 
 def _load():
     global _mod
     if _mod is None:
         from torch.utils.cpp_extension import load_inline
-        _mod = load_inline("attpatt_v100_decode", cpp_sources=_CPP, cuda_sources=_SRC, functions=["decode"],
-                           extra_cuda_cflags=["-O3", "-gencode=arch=compute_70,code=sm_70", "--use_fast_math"],
-                           verbose=False)
+
+        from vllm.attpatt_v100.jit import ext_name
+        _mod = load_inline(ext_name("attpatt_v100_decode", _CPP, _SRC, _CUDA_FLAGS), cpp_sources=_CPP,
+                           cuda_sources=_SRC, functions=["decode"], extra_cuda_cflags=_CUDA_FLAGS, verbose=False)
     return _mod
 
 

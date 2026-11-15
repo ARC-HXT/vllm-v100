@@ -10,10 +10,13 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.skipif(
-    importlib.util.find_spec("vllm._C_stable_libtorch") is None,
-    reason="needs an installed wheel with native libraries",
-)
+pytestmark = [
+    pytest.mark.cpu,
+    pytest.mark.skipif(
+        importlib.util.find_spec("vllm._C_stable_libtorch") is None,
+        reason="needs an installed wheel with native libraries",
+    ),
+]
 
 
 def _fa_dir() -> Path:

@@ -2,12 +2,16 @@
 
 import json
 
+import pytest
+
 from vllm.attpatt_v100.gemm_catalog import (
     LEGACY_SHAPES,
     configured_shapes,
     fingerprint,
     write_catalogue,
 )
+
+pytestmark = pytest.mark.cpu
 
 
 def test_missing_catalogue_preserves_legacy_dispatch(tmp_path):
