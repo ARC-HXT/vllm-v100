@@ -142,9 +142,17 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         self.num_heads_q = get_num_attention_heads_from_layers(
             vllm_config, layer_names
         ) or model_config.get_num_attention_heads(vllm_config.parallel_config)
-        self.num_heads_kv = model_config.get_num_kv_heads(vllm_config.parallel_config)
-        self.headdim = model_config.get_head_size()
-        if _attpatt_v100_reserve is not None:  # attpatt V100 decode patch: split-KV scratch, before graph capture
+        # Each cache group has its own geometry. A model-level maximum (e.g.
+        # Gemma4's D512 full attention alongside D256 sliding attention) must
+        # not determine another group's buffers or its split-kernel eligibility.
+        self.num_heads_kv = kv_cache_spec.num_kv_heads
+        self.headdim = kv_cache_spec.head_size
+        if (
+            _attpatt_v100_reserve is not None
+            and self.headdim in _attpatt_decode_dims
+            and self.num_heads_q == 4 * self.num_heads_kv
+            and not getattr(kv_cache_spec, "sliding_window", None)
+        ):  # split-KV scratch only for eligible groups, before graph capture
             _attpatt_v100_reserve(device, vllm_config.scheduler_config.max_num_seqs, self.num_heads_q,
                                   model_config.max_model_len, self.block_size, head_dim=self.headdim)
 
