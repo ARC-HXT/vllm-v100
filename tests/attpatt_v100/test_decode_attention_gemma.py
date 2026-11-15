@@ -12,7 +12,18 @@ from tests.attpatt_v100._paged import make_batch, reference  # noqa: E402
 from vllm.attpatt_v100 import decode_attention_split as S  # noqa: E402
 
 HQ, HKV, PAGE, CAP = 8, 2, 16, 40960
-TOL = 7.5e-4  # same absolute budget as the D128 / D256 split tests
+# Gemma's softmax scale is 1.0: with random D-wide q and k the logits have a standard deviation of sqrt(D), the softmax
+# is close to one-hot and outputs reach |4|, where the fp16 spacing is 2e-3 to 4e-3. Any fp16 result then carries up to
+# half of that from rounding alone, more than the 7.5e-4 the D128 / D256 split tests allow at scale D^-0.5. So the
+# budget is the rounding error of the exact result plus a margin for summation order; measured on V100 the kernel's
+# error equals the rounding error in all 15 Gemma cases (tools/v100_triton/diag_gemma_tol.py, 2026-11-15).
+MARGIN = 2.5e-4
+
+
+def assert_close(result, expected):
+    rounding = (expected.half().float() - expected).abs().max().item()
+    error = (result.float() - expected).abs().max().item()
+    assert error <= rounding + MARGIN, f"max error {error:.3g}, fp16 rounding of the exact result {rounding:.3g}"
 
 
 @pytest.fixture(autouse=True)
@@ -42,7 +53,7 @@ def test_d512_full_attention_matches_fp32(lens):
     expected = reference(q, k, v, bt, sl, 1.0)
     result = S.decode_attention(q, k, v, torch.empty_like(q), bt, sl, 1.0)
     assert torch.isfinite(result).all()
-    assert (result.float() - expected).abs().max().item() < TOL
+    assert_close(result, expected)
 
 
 @pytest.mark.parametrize("head_dim", [128, 256, 512])
@@ -52,7 +63,7 @@ def test_sliding_window_matches_fp32(head_dim, lens):
     expected = reference(q, k, v, bt, sl, 1.0, window=512)
     result = S.decode_attention(q, k, v, torch.empty_like(q), bt, sl, 1.0, window=512)
     assert torch.isfinite(result).all()
-    assert (result.float() - expected).abs().max().item() < TOL
+    assert_close(result, expected)
 
 
 def test_sliding_window_never_reads_tokens_before_the_window():
@@ -67,7 +78,7 @@ def test_sliding_window_never_reads_tokens_before_the_window():
     expected = reference(q, k, v, bt, sl, 1.0, window=window)
     result = S.decode_attention(q, k, v, torch.empty_like(q), bt, sl, 1.0, window=window)
     assert torch.isfinite(result).all()
-    assert (result.float() - expected).abs().max().item() < TOL
+    assert_close(result, expected)
 
 
 def test_window_zero_is_full_attention_bitwise():
@@ -94,4 +105,4 @@ def test_graph_replays_new_lengths(head_dim, window):
     sl.copy_(torch.tensor([0, 511, 16000, 32000], device=q.device, dtype=sl.dtype))
     graph.replay()
     torch.cuda.synchronize()
-    assert (output.float() - reference(q, k, v, bt, sl, 1.0, window=window)).abs().max().item() < TOL
+    assert_close(output, reference(q, k, v, bt, sl, 1.0, window=window))
