@@ -253,13 +253,18 @@ def build(dev, shapes=None, ms=CAPTURE_MS, cache_dir=None, select=True):
     v100.7 table copied over) are taken over instead of re-selected: same operation, same descriptors (plan 2026-11-16
     section 2.4: keep the algorithms already chosen for a shape)."""
     assert not torch.cuda.is_current_stream_capturing(), "GEMM table selection under graph capture"
-    shapes = [_shape(s) for s in (ON_SHAPES if shapes is None else shapes)]
     dev = torch.device(dev)
     cache_dir = cache_dir or CACHE_DIR
+    legacy = None
+    if shapes is None and select:
+        # the version-1 catalogue is ignored (gemm_catalog.py), so the shapes accepted in a copied legacy table are
+        # carried over from its records
+        legacy = _read(_cache_file(dev, cache_dir, LEGACY_POLICY))
+        shapes = set(ON_SHAPES) | {(K, N, False) for (_, N, K, _), r in legacy.items() if r and r.get("row")}
+    shapes = sorted({_shape(s) for s in (ON_SHAPES if shapes is None else shapes)})
     path = _cache_file(dev, cache_dir)
     recs = _read(path)
     out, dirty, t0, missing = {}, False, time.time(), 0
-    legacy = None
     for K, N, bias in shapes:
         for M in ms:
             k = (M, N, K, bias)
