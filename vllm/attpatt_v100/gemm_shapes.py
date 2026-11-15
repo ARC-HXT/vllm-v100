@@ -13,9 +13,12 @@ Rules (vllm/model_executor/layers/linear.py, vocab_parallel_embedding.py):
   rank's shard; bias when the layer has one and passes it to the GEMM (not skip_bias_add).  RowParallelLinear passes its
   bias on rank 0 only (linear.py: bias_ = None if tp_rank > 0), so at TP > 1 a row-parallel layer with a bias gives both
   (K, N, True) and (K, N, False) - shard shapes are the same on every rank;
-- the logits head: every ParallelLMHead, and with tie_word_embeddings every VocabParallelEmbedding with
-  UnquantizedEmbeddingMethod (the tied head runs the embedding's GEMM through UnquantizedEmbeddingMethod.apply; the
-  embedding is not always called embed_tokens: Falcon word_embeddings, GPT-2 wte).
+- the logits head: every ParallelLMHead, and with tie_word_embeddings the VocabParallelEmbedding with
+  UnquantizedEmbeddingMethod that has the head's size: org_vocab_size = vocab_size and embedding_dim = the inputs-embeds
+  size (hidden size; OPT word_embed_proj_dim).  The tied head runs the embedding's GEMM through
+  UnquantizedEmbeddingMethod.apply; it is found by size, not by name (Falcon word_embeddings, GPT-2 wte; Gemma-2 and
+  Command-R pass model.embed_tokens to the logits processor directly).  Other embeddings are lookups only and never
+  run a GEMM: Gemma-3n / Gemma-4 E embed_tokens_per_layer (vocab x layers * hidden_size_per_layer_input).
 Run in a subprocess with CUDA_VISIBLE_DEVICES='' (shapes_subprocess) so the GPU stays untouched and the patched global
 state dies with the process.
 usage: python -m vllm.attpatt_v100.gemm_shapes <model dir> [--tp N]  (prints a JSON list of [K, N, bias])"""
@@ -82,6 +85,7 @@ def linear_shapes(model, tp=1, trust_remote_code=False):
             setattr(ps, g, v)
         current_platform.__dict__.pop("current_device", None)
     tied = bool(getattr(cfg.model_config.hf_text_config, "tie_word_embeddings", False))
+    head_size = (cfg.model_config.get_vocab_size(), cfg.model_config.get_inputs_embeds_size())
     shapes = set()
     for _, mod in net.named_modules():
         w = getattr(mod, "weight", None)
@@ -94,7 +98,8 @@ def linear_shapes(model, tp=1, trust_remote_code=False):
                 shapes.add((int(w.shape[1]), int(w.shape[0]), False))  # ranks >= 1
         elif (isinstance(mod, VocabParallelEmbedding)
               and isinstance(getattr(mod, "quant_method", None), UnquantizedEmbeddingMethod)
-              and (isinstance(mod, ParallelLMHead) or tied)):
+              and (isinstance(mod, ParallelLMHead)
+                   or (tied and (mod.org_vocab_size, mod.embedding_dim) == head_size))):
             shapes.add((int(w.shape[1]), int(w.shape[0]), bias))
     return sorted(shapes)
 

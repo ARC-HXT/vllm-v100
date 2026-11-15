@@ -57,6 +57,24 @@ def tiny_qwen2_tied(tmp_path_factory):
         torch_dtype="bfloat16", hidden_act="silu"))
 
 
+PLE = 16  # hidden_size_per_layer_input of the tiny Gemma-4 E config
+
+
+@pytest.fixture(scope="module")
+def tiny_gemma4_ple(tmp_path_factory):
+    # Gemma-4 E text model: tied head plus a per-layer embedding (vocab x layers * PLE) that is a lookup only
+    return _model_dir(tmp_path_factory, "tiny_gemma4_ple", dict(
+        architectures=["Gemma4ForCausalLM"], model_type="gemma4_text", hidden_size=H, num_attention_heads=HEADS,
+        num_key_value_heads=KV, head_dim=D, global_head_dim=D, intermediate_size=FF, num_hidden_layers=2,
+        layer_types=["sliding_attention", "full_attention"], sliding_window=512, vocab_size=VOCAB,
+        vocab_size_per_layer_input=VOCAB, hidden_size_per_layer_input=PLE, num_kv_shared_layers=0,
+        max_position_embeddings=4096, rms_norm_eps=1e-6, final_logit_softcapping=30.0, tie_word_embeddings=True,
+        rope_parameters={
+            "full_attention": {"partial_rotary_factor": 0.25, "rope_theta": 1e6, "rope_type": "proportional"},
+            "sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"}},
+        torch_dtype="bfloat16", hidden_activation="gelu_pytorch_tanh"))
+
+
 def expected(tp):
     pad = (VOCAB + 63) // 64 * 64  # vocab padded to 64 (vocab_parallel_embedding.DEFAULT_VOCAB_PADDING_SIZE)
     return sorted({
@@ -112,6 +130,16 @@ def test_tied_head_found_without_its_name(tiny_qwen2_tied):
     shapes = json.loads([x for x in r.stdout.splitlines() if x.startswith("SHAPES ")][-1][7:])
     pad = (VOCAB + 63) // 64 * 64
     assert [H, pad, False] in shapes
+
+
+def test_per_layer_embedding_is_not_a_head(tiny_gemma4_ple):
+    # embed_tokens_per_layer is a VocabParallelEmbedding of the tied model but never runs a GEMM (gemma4.py); only the
+    # tied head (H x padded vocab) is a logits GEMM
+    from vllm.attpatt_v100.gemm_shapes import shapes_subprocess
+    pad = (VOCAB + 63) // 64 * 64
+    shapes = shapes_subprocess(tiny_gemma4_ple, 1)
+    assert (H, pad, False) in shapes
+    assert not [s for s in shapes if s[0] == 2 * PLE and s[1] == pad], shapes  # (layers * PLE, vocab)
 
 
 def test_build_cli_selects_the_enumerated_shapes(tiny_qwen2, tmp_path, monkeypatch):
