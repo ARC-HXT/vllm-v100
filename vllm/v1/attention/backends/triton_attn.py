@@ -62,11 +62,15 @@ if _attpatt_mixed:
 # attpatt V100 prefill patch: prefill rows of mixed / prefill batches on tensor cores; 1 = 1Cat flash-attention-v100
 # paged prefill kernel (JIT), 2 = torch cutlass memory-efficient attention on gathered KV; needs the mixed-batch patch
 _attpatt_prefill = None
+_attpatt_prefill_kind = None  # "flash" (1) or "cutlass" (2): which geometries it serves, vllm/attpatt_v100/dispatch.py
 if _attpatt_mixed and _os.environ.get("ATTPATT_V100_PREFILL") == "1":
     from vllm.attpatt_v100.fa_v100_prefill import _load as _attpatt_prefill_load, prefill_attention as _attpatt_prefill
     _attpatt_prefill_load()  # build / load the extension now, never inside CUDA graph capture
+    _attpatt_prefill_kind = "flash"
 elif _attpatt_mixed and _os.environ.get("ATTPATT_V100_PREFILL") == "2":
     from vllm.attpatt_v100.prefill_attention import prefill_attention as _attpatt_prefill
+    _attpatt_prefill_kind = "cutlass"
+from vllm.attpatt_v100 import dispatch as _attpatt_dispatch  # pure rules, no CUDA; used only with the patches on
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVQuantMode,
@@ -738,35 +742,61 @@ class TritonAttentionImpl(AttentionImpl):
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
         q_lo = 0
-        # causal sliding window (decoder: (window - 1, 0)) runs on the split kernel as its last `window` tokens
-        _attpatt_window = self.sliding_window[0] + 1 if self.sliding_window[0] >= 0 else 0
-        if _attpatt_v100_decode is not None and (  # attpatt V100 decode / mixed-batch patch
-                key_cache.dtype == torch.float16 and self.alibi_slopes is None
-                and (tuple(self.sliding_window) == (-1, -1)
-                     or (self.sliding_window[1] == 0 and _attpatt_v100_reserve is not None))
-                and not self.logits_soft_cap and self.sinks is None
-                and output_scale is None and mm_prefix_range_tensor is None and attn_metadata.rswa_window is None
-                and query.shape[2] in _attpatt_decode_dims and query.shape[1] == 4 * key_cache.shape[2]):
-            _attpatt_kw = {"window": _attpatt_window} if _attpatt_window else {}  # window: split kernel only
-            # v0.33 KV layout: key_cache / value_cache are strided views [blocks, page, kv_heads, 128] of the
-            # [blocks, kv_heads, page, 2 * 128] cache (the kernel takes strides; head_dim stays contiguous)
-            if max_seqlen_q == 1:
+        if _attpatt_v100_decode is not None and _attpatt_dispatch.call_ok(  # attpatt V100 decode / prefill patches
+                kv_fp16=key_cache.dtype == torch.float16, output_scale=output_scale,
+                mm_prefix=mm_prefix_range_tensor, rswa=attn_metadata.rswa_window):
+            # decode rows and prefill rows are decided independently (vllm/attpatt_v100/dispatch.py)
+            route = self.__dict__.get("_attpatt_route")
+            if route is None:
+                dec = _attpatt_dispatch.decode_ok(
+                    num_q_heads=query.shape[1], num_kv_heads=key_cache.shape[2], head_dim=query.shape[2],
+                    sliding_window=tuple(self.sliding_window), softcap=self.logits_soft_cap,
+                    alibi=self.alibi_slopes is not None, sinks=self.sinks is not None,
+                    decode_dims=_attpatt_decode_dims, split_kernel=_attpatt_v100_reserve is not None)
+                pre = _attpatt_prefill is not None and _attpatt_dispatch.prefill_ok(
+                    kind=_attpatt_prefill_kind, head_dim=query.shape[2], sliding_window=tuple(self.sliding_window),
+                    softcap=self.logits_soft_cap, alibi=self.alibi_slopes is not None,
+                    sinks=self.sinks is not None, decode=dec)
+                route = self._attpatt_route = (dec, pre, _attpatt_dispatch.window_tokens(tuple(self.sliding_window)))
+            dec, pre, window = route
+            # causal sliding window (decoder: (window - 1, 0)) runs on the split kernel as its last `window` tokens
+            _attpatt_kw = {"window": window} if window else {}
+            # v0.33 KV layout: key_cache / value_cache are strided views [blocks, page, kv_heads, D] of the
+            # [blocks, kv_heads, page, 2 * D] cache (the kernels take strides; head_dim stays contiguous)
+            if dec and max_seqlen_q == 1:
                 _attpatt_v100_decode(query[:num_actual_tokens], key_cache, value_cache, output[:num_actual_tokens],
                                      block_table, seqused_k, self.scale, **_attpatt_kw)
                 return output
             nd = getattr(attn_metadata, "attpatt_num_decodes", 0)
             seq_lens_cpu = getattr(attn_metadata, "attpatt_seq_lens_cpu", None)
-            if (_attpatt_prefill is not None and seq_lens_cpu is not None and attn_metadata.causal
-                    and query.shape[2] == 128 and not _attpatt_window):
-                # attpatt V100 prefill patch: decode rows on the CUDA decode kernel, prefill rows on tensor cores
+            if (pre and max_seqlen_q > 1 and seq_lens_cpu is not None and attn_metadata.causal
+                    and _attpatt_dispatch.prefill_kernel(head_dim=query.shape[2],
+                                                         sliding_window=tuple(self.sliding_window),
+                                                         max_query_len=max_seqlen_q) == "cutlass"):
+                # attpatt V100 prefill patch: prefill rows on tensor cores; decode rows [0, nd) on the CUDA decode
+                # kernel where it serves the geometry, otherwise on the stock kernel restricted to those rows
                 qsl_cpu = attn_metadata.attpatt_qsl_cpu
-                if nd > 0:
+                if nd > 0 and dec:
                     _attpatt_v100_decode(query[:nd], key_cache, value_cache, output[:nd], block_table[:nd],
                                          seqused_k[:nd], self.scale, **_attpatt_kw)
+                elif nd > 0:
+                    unified_attention(
+                        q=query[:nd], k=key_cache, v=value_cache, out=output[:nd],
+                        cu_seqlens_q=cu_seqlens_q[:nd + 1], max_seqlen_q=1, seqused_k=seqused_k[:nd],
+                        max_seqlen_k=max_seqlen_k, softmax_scale=self.scale, causal=attn_metadata.causal,
+                        alibi_slopes=None, use_alibi_sqrt=self.use_alibi_sqrt, window_size=self.sliding_window,
+                        block_table=block_table[:nd], softcap=0, q_descale=q_descale, k_descale=k_descale[:nd],
+                        v_descale=v_descale[:nd], seq_threshold_3D=seq_threshold_3D,
+                        num_par_softmax_segments=num_par_softmax_segments, softmax_segm_output=softmax_segm_output,
+                        softmax_segm_max=softmax_segm_max, softmax_segm_expsum=softmax_segm_expsum, sinks=None,
+                        output_scale=None, mm_prefix_range=None, rswa_prefix_lens=None, rswa_window=None,
+                        kv_quant_mode=self._kv_quant_mode, k_scale_cache=k_scale_cache, v_scale_cache=v_scale_cache,
+                        chunk_lookback=self.chunk_lookback, use_td=self.use_td,
+                        mm_prefix_clamp_sliding_window=getattr(layer, "mm_prefix_clamp_sliding_window", False))
                 _attpatt_prefill(query, key_cache, value_cache, output, block_table, qsl_cpu, seq_lens_cpu, nd,
-                                 qsl_cpu.shape[0] - 1, self.scale)
+                                 qsl_cpu.shape[0] - 1, self.scale, **_attpatt_kw)
                 return output
-            if nd > 0:
+            if dec and nd > 0:
                 # rows [0, nd) are decode requests with one query token each: CUDA kernel; the rest: stock kernel
                 _attpatt_v100_decode(query[:nd], key_cache, value_cache, output[:nd], block_table[:nd],
                                      seqused_k[:nd], self.scale, **_attpatt_kw)

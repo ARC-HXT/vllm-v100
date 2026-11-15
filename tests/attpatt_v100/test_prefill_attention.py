@@ -76,6 +76,51 @@ def test_prefill_rows_match_the_stock_kernel_on_the_whole_batch(kernel, nd, pre)
             assert (out[lo:hi] - ref[lo:hi]).abs().max().item() < 2e-3
 
 
+# (q heads, kv heads, head dim, window) of the geometries the split dispatch sends to cutlass (plan 2026-11-16 round 1
+# item 4): Qwen2.5-7B G7, Llama-70B TP8 G8, gemma-3-27b TP4 G2 + window 1024, Qwen3.5 D256, D256 + window 4096,
+# Gemma-4 D512, Mistral-7B window 4096
+GEOMETRIES = [(28, 4, 128, 0), (8, 1, 128, 0), (8, 4, 128, 1024), (16, 4, 256, 0), (8, 2, 256, 4096), (8, 2, 512, 0),
+              (32, 8, 128, 4096)]
+# fresh prompts (M = L) and later chunks (M < L), windows shorter and longer than the chunk, a page-unaligned window start
+GEOMETRY_CASES = [[(17, 17), (2048, 2048)], [(300, 5000), (1, 1)], [(64, 9001), (1500, 1500)]]
+
+
+@pytest.mark.parametrize("pre", GEOMETRY_CASES)
+@pytest.mark.parametrize("hq,hkv,d,window", GEOMETRIES)
+def test_cutlass_prefill_geometries_match_the_stock_kernel(hq, hkv, d, window, pre):
+    from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+    dev, f16, nd = "cuda", torch.float16, 2
+    g = torch.Generator(device="cpu").manual_seed(hq * 1000 + d + window)
+    ql = [1] * nd + [q for q, _ in pre]
+    sl = torch.randint(50, 3000, (nd,), generator=g).tolist() + [s for _, s in pre]
+    B = len(ql)
+    nbs = [(s + BS - 1) // BS for s in sl]
+    kv = torch.randn(sum(nbs) + 1, hkv, BS, 2 * d, device=dev, dtype=f16)
+    kc, vc = kv.transpose(1, 2).split(d, dim=-1)
+    perm = (torch.randperm(sum(nbs), generator=g) + 1).tolist()
+    bt = torch.zeros(B, max(nbs), dtype=torch.int32)
+    i = 0
+    for b, nb in enumerate(nbs):
+        bt[b, :nb] = torch.tensor(perm[i:i + nb], dtype=torch.int32)
+        i += nb
+    bt = bt.to(dev)
+    q = torch.randn(sum(ql), hq, d, device=dev, dtype=f16)
+    cu_cpu = torch.tensor([0] + torch.tensor(ql).cumsum(0).tolist(), dtype=torch.int32)
+    sl_cpu = torch.tensor(sl, dtype=torch.int32)
+    ks = torch.ones(1, device=dev, dtype=torch.float32).expand(B, hkv)
+    sc = d ** -0.5
+    wsize = (window - 1, 0) if window else (-1, -1)
+    ref = torch.empty_like(q)
+    unified_attention(q, kc, vc, ref, cu_cpu.to(dev), max(ql), sl_cpu.to(dev), max(sl), sc, True, wsize, bt, 0, None,
+                      ks, ks)
+    out = torch.full_like(q, float("nan"))
+    cutlass_prefill.prefill_attention(q, kc, vc, out, bt, cu_cpu, sl_cpu, nd, B, sc, window=window)
+    torch.cuda.synchronize()
+    assert not out[nd:].isnan().any()                # every prefill row written
+    assert out[:nd].isnan().all()                    # decode rows untouched
+    assert (out[nd:] - ref[nd:]).abs().max().item() < 2e-3
+
+
 def test_cutlass_prefill_does_not_copy_kv_per_query_head():
     """GQA by a stride-0 broadcast: the only extra memory of a 32k-token request is its gathered KV (4 KiB per token,
     128 MiB) plus the kernel's own buffers - far below the 512 MiB a per-query-head copy of K and V would add"""

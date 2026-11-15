@@ -19,9 +19,13 @@ CAUSAL_FROM_BOTTOM_RIGHT = 2  # PyTorch CustomMaskType
 
 
 def prefill_attention(query, key_cache, value_cache, output, block_table, query_start_loc_cpu, seq_lens_cpu,
-                      req_lo, num_reqs, scale):
+                      req_lo, num_reqs, scale, window=0):
     """query / output [tokens, Hq, D] (rows of the whole batch); key_cache / value_cache [blocks, page, Hkv, D] views;
-    requests req_lo .. num_reqs - 1, token ranges from query_start_loc_cpu, total lengths from seq_lens_cpu"""
+    requests req_lo .. num_reqs - 1, token ranges from query_start_loc_cpu, total lengths from seq_lens_cpu.
+    Any query heads per KV head and any head dim the cutlass kernel takes (multiple of 8).  window > 0: causal sliding
+    window of `window` tokens including the query (vLLM sliding_window (window - 1, 0)); only the keys some query of the
+    chunk can see are gathered, and the kernel's window_size masks the rest (same semantics: query at position p sees
+    p - window < j <= p; tools/v100_triton/prefill_attn_options.py, error = fp16 rounding of the fp32 reference)."""
     page = key_cache.shape[1]
     hkv, d = key_cache.shape[2], key_cache.shape[3]
     groups = query.shape[1] // hkv
@@ -30,14 +34,17 @@ def prefill_attention(query, key_cache, value_cache, output, block_table, query_
         if qe == qs:
             continue
         total = int(seq_lens_cpu[r])
-        nb = (total + page - 1) // page
-        blocks = block_table[r, :nb]
-        k = key_cache.index_select(0, blocks).reshape(nb * page, hkv, d)[:total]
-        v = value_cache.index_select(0, blocks).reshape(nb * page, hkv, d)[:total]
         m = qe - qs
+        lo = max(0, total - m - window + 1) if window else 0  # first key any query of the chunk can see
+        p0, nb = lo // page, (total + page - 1) // page
+        blocks = block_table[r, p0:nb]
+        n = total - lo
+        k = key_cache.index_select(0, blocks).reshape((nb - p0) * page, hkv, d)[lo - p0 * page:][:n]
+        v = value_cache.index_select(0, blocks).reshape((nb - p0) * page, hkv, d)[lo - p0 * page:][:n]
         # q [M, Hq, D] -> [groups, M, Hkv, D] view; K/V [1, L, Hkv, D] expanded to the batch with stride 0
         q = query[qs:qe].view(m, hkv, groups, d).permute(2, 0, 1, 3)
         out = torch.ops.aten._efficient_attention_forward(
-            q, k.unsqueeze(0).expand(groups, total, hkv, d), v.unsqueeze(0).expand(groups, total, hkv, d),
-            None, None, None, None, None, 0.0, CAUSAL_FROM_BOTTOM_RIGHT, False, scale=scale)[0]
+            q, k.unsqueeze(0).expand(groups, n, hkv, d), v.unsqueeze(0).expand(groups, n, hkv, d),
+            None, None, None, None, None, 0.0, CAUSAL_FROM_BOTTOM_RIGHT, False, scale=scale,
+            window_size=window or None)[0]
         output[qs:qe].view(m, hkv, groups, d).copy_(out.permute(1, 2, 0, 3))

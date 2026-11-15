@@ -19,8 +19,8 @@ torch.cuda.is_current_stream_capturing = lambda: False
 torch.cuda.device = lambda d: contextlib.nullcontext()
 from vllm.attpatt_v100 import gemm as G
 cache, k, n, start = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4])
-G._cache_file = lambda dev, cache_dir: cache_dir + "/records.json"
-def stub(dev, M, N, K):
+G._cache_file = lambda dev, cache_dir, policy=None: cache_dir + ("/records.json" if policy is None else "/legacy.json")
+def stub(dev, M, N, K, bias=False):
     time.sleep(0.25)
     return dict(M=M, N=N, K=K, row=[M] * 16)
 G._select = stub
@@ -40,8 +40,8 @@ def test_concurrent_builders_keep_every_record_and_shape(tmp_path):
         assert p.returncode == 0, err[-3000:]
     assert time.time() > start, "builders finished before the common start: raise the start delay"
     with open(tmp_path / "records.json") as f:
-        keys = {tuple(int(t) for t in k.split(",")) for k in json.load(f)}
+        keys = {tuple(int(t) for t in k.split(","))[:3] for k in json.load(f)}  # M,N,K[,bias]
     assert keys == {(m, n, 64) for m in range(1, 9) for n in (128, 256)}
     with open(tmp_path / "shapes.json") as f:
-        shapes = {tuple(s) for s in json.load(f)["shapes"]}
+        shapes = {tuple(s)[:2] for s in json.load(f)["shapes"]}  # [K, N(, bias)]
     assert shapes == {(64, 128), (64, 256)}

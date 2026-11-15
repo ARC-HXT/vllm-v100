@@ -9,7 +9,8 @@ combination checked with cublasLtMatmulAlgoCheck.  Each returned row = 8 int64 o
 int64 of info [algo id, tile id, stages id, split-K, reduction scheme, swizzle, custom option, workspace bytes].
 
 Column-major view used by cuBLASLt: D[N,M] = op(A)[N,K] * B[K,M] with A = W (K x N col-major, transa = T), B = x
-(K x M col-major, no transpose), D = y (N x M col-major, ld N) - the same call torch makes for F.linear."""
+(K x M col-major, no transpose), D = y (N x M col-major, ld N) - the same call torch makes for F.linear.  With a bias,
+CUBLASLT_EPILOGUE_BIAS adds the length-N vector to every column of D (torch's F.linear(x, w, b) uses the same epilogue)."""
 import os
 import torch
 
@@ -26,12 +27,15 @@ _CPP = r"""
 
 static cublasLtHandle_t g_lt = nullptr;
 struct Descs { cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t a, b, c; };
-static std::map<std::tuple<int64_t, int64_t, int64_t>, Descs> g_descs;
+// key (M, N, K, bias): with bias the descriptor carries CUBLASLT_EPILOGUE_BIAS (fp16 bias of length N added in the
+// fp32 epilogue before the single rounding to fp16, as F.linear(x, w, b) does), so algorithms are enumerated, checked
+// and run for exactly that operation
+static std::map<std::tuple<int64_t, int64_t, int64_t, bool>, Descs> g_descs;
 
 static cublasLtHandle_t lt() { if (!g_lt) LT_CHECK(cublasLtCreate(&g_lt)); return g_lt; }
 
-static Descs& descs(int64_t M, int64_t N, int64_t K) {
-  auto key = std::make_tuple(M, N, K);
+static Descs& descs(int64_t M, int64_t N, int64_t K, bool bias) {
+  auto key = std::make_tuple(M, N, K, bias);
   auto it = g_descs.find(key);
   if (it != g_descs.end()) return it->second;
   Descs d;
@@ -39,6 +43,12 @@ static Descs& descs(int64_t M, int64_t N, int64_t K) {
   cublasOperation_t ta = CUBLAS_OP_T, tb = CUBLAS_OP_N;
   LT_CHECK(cublasLtMatmulDescSetAttribute(d.op, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta)));
   LT_CHECK(cublasLtMatmulDescSetAttribute(d.op, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof(tb)));
+  if (bias) {
+    cublasLtEpilogue_t epi = CUBLASLT_EPILOGUE_BIAS;
+    cudaDataType_t bt = CUDA_R_16F;
+    LT_CHECK(cublasLtMatmulDescSetAttribute(d.op, CUBLASLT_MATMUL_DESC_EPILOGUE, &epi, sizeof(epi)));
+    LT_CHECK(cublasLtMatmulDescSetAttribute(d.op, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bt, sizeof(bt)));
+  }
   LT_CHECK(cublasLtMatrixLayoutCreate(&d.a, CUDA_R_16F, K, N, K));
   LT_CHECK(cublasLtMatrixLayoutCreate(&d.b, CUDA_R_16F, K, M, K));
   LT_CHECK(cublasLtMatrixLayoutCreate(&d.c, CUDA_R_16F, N, M, N));
@@ -67,8 +77,8 @@ static torch::Tensor rows(std::vector<int64_t>& out) {
   return t;
 }
 
-torch::Tensor heuristic(int64_t M, int64_t N, int64_t K, int64_t ws_bytes, int64_t count) {
-  Descs& d = descs(M, N, K);
+torch::Tensor heuristic(int64_t M, int64_t N, int64_t K, int64_t ws_bytes, int64_t count, bool bias) {
+  Descs& d = descs(M, N, K, bias);
   cublasLtMatmulPreference_t pref;
   LT_CHECK(cublasLtMatmulPreferenceCreate(&pref));
   uint64_t ws = (uint64_t)ws_bytes;
@@ -91,8 +101,8 @@ template <typename T> static std::vector<T> cap_array(const cublasLtMatmulAlgo_t
   return v;
 }
 
-torch::Tensor enumerate(int64_t M, int64_t N, int64_t K, int64_t ws_bytes, std::vector<int64_t> splits) {
-  Descs& d = descs(M, N, K);
+torch::Tensor enumerate(int64_t M, int64_t N, int64_t K, int64_t ws_bytes, std::vector<int64_t> splits, bool bias) {
+  Descs& d = descs(M, N, K, bias);
   int ids[256]; int nids = 0;
   LT_CHECK(cublasLtMatmulAlgoGetIds(lt(), CUBLAS_COMPUTE_32F, CUDA_R_32F, CUDA_R_16F, CUDA_R_16F, CUDA_R_16F, CUDA_R_16F,
                                     256, ids, &nids));
@@ -138,11 +148,19 @@ int64_t version() { lt(); return (int64_t)cublasLtGetVersion(); }
 
 // create the handle and the descriptors of one problem now (host side only), so a later call under CUDA graph capture
 // only looks them up
-void prepare(int64_t M, int64_t N, int64_t K) { descs(M, N, K); }
+void prepare(int64_t M, int64_t N, int64_t K, bool bias) { descs(M, N, K, bias); }
 
-void matmul(torch::Tensor x, torch::Tensor w, torch::Tensor y, torch::Tensor algo_row, torch::Tensor workspace) {
+// bias: fp16 [N] or None; its pointer is set on the shared descriptor right before the call (host side, so a CUDA graph
+// captures the pointer of the call being captured)
+void matmul(torch::Tensor x, torch::Tensor w, torch::Tensor y, torch::Tensor algo_row, torch::Tensor workspace,
+            c10::optional<torch::Tensor> bias) {
   int64_t M = x.size(0), K = x.size(1), N = w.size(0);
-  Descs& d = descs(M, N, K);
+  Descs& d = descs(M, N, K, bias.has_value());
+  if (bias.has_value()) {
+    TORCH_CHECK(bias->scalar_type() == at::kHalf && bias->numel() == N && bias->is_contiguous(), "fp16 bias [N]");
+    const void* p = bias->data_ptr();
+    LT_CHECK(cublasLtMatmulDescSetAttribute(d.op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &p, sizeof(p)));
+  }
   cublasLtMatmulAlgo_t algo; std::memcpy(&algo, algo_row.data_ptr<int64_t>(), sizeof(algo));
   float alpha = 1.f, beta = 0.f;
   LT_CHECK(cublasLtMatmul(lt(), d.op, &alpha, w.data_ptr(), d.a, x.data_ptr(), d.b, &beta, y.data_ptr(), d.c,
@@ -170,22 +188,23 @@ def _load():
     return _mod
 
 
-def heuristic(M, N, K, ws_bytes, count=64):
-    return _load().heuristic(M, N, K, ws_bytes, count)
+def heuristic(M, N, K, ws_bytes, count=64, bias=False):
+    return _load().heuristic(M, N, K, ws_bytes, count, bias)
 
 
-def enumerate_algos(M, N, K, ws_bytes, splits=(1, 2, 3, 4, 5, 6, 8, 12, 16)):
-    return _load().enumerate(M, N, K, ws_bytes, list(splits))
+def enumerate_algos(M, N, K, ws_bytes, splits=(1, 2, 3, 4, 5, 6, 8, 12, 16), bias=False):
+    return _load().enumerate(M, N, K, ws_bytes, list(splits), bias)
 
 
 def version():
     return _load().version()
 
 
-def prepare(M, N, K):
-    _load().prepare(M, N, K)
+def prepare(M, N, K, bias=False):
+    _load().prepare(M, N, K, bias)
 
 
-def matmul(x, w, y, algo_row, workspace):
-    """y[M,N] = x[M,K] @ w[N,K]^T with the given algo row (CPU int64, first 8 entries = algo); all fp16 contiguous"""
-    _load().matmul(x, w, y, algo_row, workspace)
+def matmul(x, w, y, algo_row, workspace, bias=None):
+    """y[M,N] = x[M,K] @ w[N,K]^T (+ bias[N] in the epilogue) with the given algo row (CPU int64, first 8 entries =
+    algo, chosen for the same bias / no-bias operation); all fp16 contiguous"""
+    _load().matmul(x, w, y, algo_row, workspace, bias)

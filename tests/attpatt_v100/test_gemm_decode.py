@@ -67,7 +67,7 @@ def data(m, k, n, seed):
 def test_decode_table_and_fp32_reference(k, n, m):
     # the catalogue lists exactly the shapes with an accepted entry
     accepted = any(G.entry(0, mm, n, k) is not None for mm in MS)
-    assert ((k, n) in G.ON_SHAPES) == accepted
+    assert ((k, n, False) in G.ON_SHAPES) == accepted  # catalogue v2: (K, N, bias)
     for seed in (71, 72):
         x, w = data(m, k, n, seed)
         ref = F.linear(x.float(), w.float())

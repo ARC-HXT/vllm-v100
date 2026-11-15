@@ -17,10 +17,12 @@ Rules:
 - an entry is kept only if it beats F.linear by MIN_GAIN in an interleaved re-measurement AND, on two random inputs,
   its max abs error against an fp32 reference is not above F.linear's and its RMS error not above F.linear's x RMS_TOL;
   split-K only with fp32 partial sums; otherwise the entry is None;
-- anything outside the table (other M, other shapes, bias, non-fp16, non-contiguous input, an operand not 256-byte
+- a layer with a bias is its own shape (K, N, bias=True): cuBLASLt with the bias epilogue, selected and gated against
+  F.linear(x, w, b) (one rounding, as the epilogue does; "GEMM then add_" rounds twice and failed the gate);
+- anything outside the table (other M, other shapes, non-fp16, non-contiguous input, an operand or bias not 256-byte
   aligned, entry None, table not ready under capture) runs F.linear itself, so it is bitwise the stock path.
-Scope: legacy Qwen3-4B qkv/down plus accepted offline shapes in shapes.json.
-Each (M, N, K) needs a matching device/version record; otherwise it runs F.linear.
+Scope: legacy Qwen3-4B qkv/down plus accepted offline shapes in shapes.json (catalogue version 2, gemm_catalog.py).
+Each (M, N, K, bias) needs a matching device/version record; otherwise it runs F.linear.
 Cache directory: $ATTPATT_V100_GEMM_CACHE, default $VLLM_CACHE_ROOT/attpatt_v100_gemm (~/.cache/vllm/attpatt_v100_gemm).
 CLI: python -m vllm.attpatt_v100.gemm build   (fills the cache for all ON_SHAPES x CAPTURE_MS on cuda:0, about 6 min
 on a V100; one JSON line per entry)"""
@@ -39,7 +41,7 @@ from vllm.attpatt_v100.gemm_catalog import (
     write_catalogue,
 )
 
-ON_SHAPES = configured_shapes()  # (K, N), legacy plus offline-accepted shapes
+ON_SHAPES = configured_shapes()  # (K, N, bias), legacy plus offline-accepted shapes
 # vLLM 0.19 default capture sizes when max_cudagraph_capture_size = 512 (vllm/config/vllm.py:1418-1443;
 # max = min(max_num_seqs * 2, 512) = 512 for the production max_num_seqs 256)
 CAPTURE_MS = [1, 2, 4] + list(range(8, 256, 8)) + list(range(256, 513, 16))
@@ -48,11 +50,14 @@ MIN_GAIN = 0.03  # keep an entry only if it is at least 3 % faster than F.linear
 TOP = 8  # candidates re-timed in CUDA graphs after the quick eager pass
 FINAL = 3  # candidates in the interleaved re-measurement against F.linear
 ROUNDS = 15
-POLICY = "fp32red_rms"  # candidate policy, part of the cache file name (see _fp32_partials, _not_worse)
-ALIGN = 256  # bytes, for x, weight and y (see gemm)
+# candidate policy, part of the cache file name (see _fp32_partials, _not_worse); "_bias": records are keyed
+# (M, N, K, bias) and bias entries use the epilogue (plan 2026-11-16 round 1 item 3)
+POLICY = "fp32red_rms_bias"
+LEGACY_POLICY = "fp32red_rms"  # v0.33.0-v100.7 and earlier: (M, N, K) records, no bias
+ALIGN = 256  # bytes, for x, weight, bias and y (see gemm)
 CACHE_DIR = default_cache_dir()
 
-_table = {}  # (device index, M, N, K) -> CPU int64 row (16) or None
+_table = {}  # (device index, M, N, K, bias) -> CPU int64 row (16) or None
 _ready = set()  # device indices whose table is loaded / built for ON_SHAPES
 _ws = {}  # device index -> workspace (uint8), allocated once in prepare()
 _logged = set()
@@ -137,51 +142,54 @@ def _fp32_partials(row):
     splitk, red = int(row[11]), int(row[12])
     return splitk <= 1 or red == 2
 
-def _select(dev, M, N, K):
-    """returns the cache record of one problem: row (16 ints) or None, plus the measured times and errors"""
+def _select(dev, M, N, K, bias=False):
+    """returns the cache record of one problem: row (16 ints) or None, plus the measured times and errors.  bias: the
+    operation is F.linear(x, w, b) and the candidates are cuBLASLt algorithms with the bias epilogue"""
     # inputs are drawn on the GPU: a CPU generator took most of the selection time (the N=248320 weight alone is
     # 1e9 numbers, single-threaded, while the GPU waited; test_gemm_decode 2026-11-15)
-    g = torch.Generator(device=dev).manual_seed(M * 1000003 + N * 101 + K)
+    g = torch.Generator(device=dev).manual_seed(M * 1000003 + N * 101 + K + (7 if bias else 0))
     w = torch.randn(N, K, generator=g, device=dev, dtype=torch.float16) / K ** 0.5
+    b = torch.randn(N, generator=g, device=dev, dtype=torch.float16) if bias else None
     xs = [torch.randn(M, K, generator=g, device=dev, dtype=torch.float16) for _ in range(2)]
-    refs = [x.float() @ w.float().t() for x in xs]
+    refs = [x.float() @ w.float().t() + (b.float() if bias else 0) for x in xs]
     x = xs[0]
     y = torch.empty(M, N, dtype=torch.float16, device=dev)
     ws = torch.empty(WS_BYTES, dtype=torch.uint8, device=dev)
-    f_err = [_err(F.linear(xx, w), r) for xx, r in zip(xs, refs)]
+    f_err = [_err(F.linear(xx, w, b), r) for xx, r in zip(xs, refs)]
 
     def errs(row):
         out = []
         for xx, r in zip(xs, refs):
-            lt.matmul(xx, w, y, row, ws)
+            lt.matmul(xx, w, y, row, ws, b)
             out.append(_err(y, r))
         return out
 
-    rows = lt.enumerate_algos(M, N, K, WS_BYTES)
-    heur = lt.heuristic(M, N, K, WS_BYTES)
+    rows = lt.enumerate_algos(M, N, K, WS_BYTES, bias=bias)
+    heur = lt.heuristic(M, N, K, WS_BYTES, bias=bias)
     cands = [r.clone() for r in list(rows) + list(heur) if _fp32_partials(r)]
     quick = []
     for r in cands:
         try:
-            quick.append((eager_time(lambda: lt.matmul(x, w, y, r, ws)), r))
+            quick.append((eager_time(lambda: lt.matmul(x, w, y, r, ws, b)), r))
         except RuntimeError:  # a configuration cuBLASLt accepted in the check but refuses to run
             continue
     quick.sort(key=lambda q: q[0])
     timed = []
     for _, r in quick[:TOP]:
         e = errs(r)
-        if all(_not_worse(a, b) for a, b in zip(e, f_err)):
-            timed.append((graph_time(lambda: lt.matmul(x, w, y, r, ws)), r, e))
+        if all(_not_worse(a, c) for a, c in zip(e, f_err)):
+            timed.append((graph_time(lambda: lt.matmul(x, w, y, r, ws, b)), r, e))
     timed.sort(key=lambda t: t[0])
-    arms = [("flinear", make_graph(lambda: F.linear(x, w)), None, f_err)]
-    arms += [(f"lt{i}", make_graph((lambda rr: lambda: lt.matmul(x, w, y, rr, ws))(r)), r, e)
+    arms = [("flinear", make_graph(lambda: F.linear(x, w, b)), None, f_err)]
+    arms += [(f"lt{i}", make_graph((lambda rr: lambda: lt.matmul(x, w, y, rr, ws, b))(r)), r, e)
              for i, (_, r, e) in enumerate(timed[:FINAL])]
     ts = {name: [] for name, _, _, _ in arms}
     for _ in range(ROUNDS):
         for name, gr, _, _ in arms:
             ts[name].append(replay_time(gr))
     med = {k: sorted(v)[len(v) // 2] for k, v in ts.items()}
-    rec = dict(M=M, N=N, K=K, t_flinear=round(med["flinear"], 2), err_flinear=f_err, candidates=len(cands), row=None)
+    rec = dict(M=M, N=N, K=K, bias=bool(bias), t_flinear=round(med["flinear"], 2), err_flinear=f_err,
+               candidates=len(cands), row=None)
     best = min(arms[1:], key=lambda a: med[a[0]], default=None)
     if best is not None:
         rec.update(t_lt=round(med[best[0]], 2), err_lt=best[3], info=best[2][8:].tolist())
@@ -191,18 +199,29 @@ def _select(dev, M, N, K):
     return rec
 
 
-def _cache_file(dev, cache_dir):
-    name = f"{torch.cuda.get_device_name(dev)}_cublasLt{lt.version()}_torch{torch.__version__}_{POLICY}"
+def _cache_file(dev, cache_dir, policy=None):
+    name = f"{torch.cuda.get_device_name(dev)}_cublasLt{lt.version()}_torch{torch.__version__}_{policy or POLICY}"
     return os.path.join(cache_dir, "".join(c if c.isalnum() or c in "._-" else "_" for c in name) + ".json")
 
 
+def _shape(s):
+    """(K, N) or (K, N, bias) -> (K, N, bias)"""
+    return (int(s[0]), int(s[1]), bool(s[2]) if len(s) > 2 else False)
+
+
 def _read(path):
+    """{(M, N, K, bias): record}; keys 'M,N,K,bias' (bias 0/1), or 'M,N,K' in a LEGACY_POLICY file (no bias)"""
     recs = {}
     if os.path.exists(path):
         with open(path) as f:
             for k, v in json.load(f).items():
-                recs[tuple(int(t) for t in k.split(","))] = v
+                t = tuple(int(x) for x in k.split(","))
+                recs[(t[0], t[1], t[2], bool(t[3]) if len(t) > 3 else False)] = v
     return recs
+
+
+def _key(k):
+    return ",".join(map(str, (k[0], k[1], k[2], int(k[3]))))
 
 
 def _store(path, recs, cache_dir):
@@ -216,7 +235,7 @@ def _store(path, recs, cache_dir):
         merged.update(recs)
         tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w") as f:
-            json.dump({",".join(map(str, k)): v for k, v in sorted(merged.items())}, f)
+            json.dump({_key(k): v for k, v in sorted(merged.items())}, f)
         os.replace(tmp, path)  # atomic: another process never reads a half-written cache
         # Engines never select or update dispatch. A fresh worker reads this
         # static catalogue; algorithm rows still use the device/version key.
@@ -224,34 +243,45 @@ def _store(path, recs, cache_dir):
 
 
 def build(dev, shapes=None, ms=CAPTURE_MS, cache_dir=None, select=True):
-    """load the cache records of shapes (default ON_SHAPES, read at call time) x ms; with select, select (and merge into
-    the cache) the missing ones, without select they are None (-> F.linear).  Returns {(M, N, K): record}.  Must not run
-    under CUDA graph capture."""
+    """load the cache records of shapes ((K, N) or (K, N, bias); default ON_SHAPES, read at call time) x ms; with select,
+    select (and merge into the cache) the missing ones, without select they are None (-> F.linear).  Returns
+    {(M, N, K, bias): record}.  Must not run under CUDA graph capture.
+    With select, no-bias records of the previous candidate policy (LEGACY_POLICY file in the same directory, e.g. a
+    v100.7 table copied over) are taken over instead of re-selected: same operation, same descriptors (plan 2026-11-16
+    section 2.4: keep the algorithms already chosen for a shape)."""
     assert not torch.cuda.is_current_stream_capturing(), "GEMM table selection under graph capture"
-    shapes = ON_SHAPES if shapes is None else shapes
+    shapes = [_shape(s) for s in (ON_SHAPES if shapes is None else shapes)]
     dev = torch.device(dev)
-    path = _cache_file(dev, cache_dir or CACHE_DIR)
+    cache_dir = cache_dir or CACHE_DIR
+    path = _cache_file(dev, cache_dir)
     recs = _read(path)
     out, dirty, t0, missing = {}, False, time.time(), 0
-    for K, N in shapes:
+    legacy = None
+    for K, N, bias in shapes:
         for M in ms:
-            if (M, N, K) not in recs and not select:
+            k = (M, N, K, bias)
+            if k not in recs and not select:
                 missing += 1
-                out[(M, N, K)] = None
+                out[k] = None
                 continue
-            if (M, N, K) not in recs:
-                with torch.cuda.device(dev):
-                    recs[(M, N, K)] = _select(dev, M, N, K)
+            if k not in recs:
+                if legacy is None:
+                    legacy = _read(_cache_file(dev, cache_dir, LEGACY_POLICY))
+                if not bias and k in legacy:
+                    recs[k] = legacy[k]
+                else:
+                    with torch.cuda.device(dev):
+                        recs[k] = _select(dev, M, N, K, bias)
+                    print(json.dumps(recs[k]), flush=True)
                 dirty = True
-                print(json.dumps(recs[(M, N, K)]), flush=True)
-                _store(path, {(M, N, K): recs[(M, N, K)]}, cache_dir or CACHE_DIR)
-            out[(M, N, K)] = recs[(M, N, K)]
+                _store(path, {k: recs[k]}, cache_dir)
+            out[k] = recs[k]
     if dirty:
         _log(f"selected missing entries in {time.time() - t0:.0f} s -> {path}")
     elif select:
-        _store(path, {}, cache_dir or CACHE_DIR)  # the catalogue follows the cache file even when nothing was missing
+        _store(path, {}, cache_dir)  # the catalogue follows the cache file even when nothing was missing
     if missing:
-        _log(f"{missing} (M, N, K) entries missing from {path} -> F.linear for them "
+        _log(f"{missing} (M, N, K, bias) entries missing from {path} -> F.linear for them "
              f"(build the table with: python -m vllm.attpatt_v100.gemm build)")
     return out
 
@@ -263,49 +293,53 @@ def prepare(dev):
         return
     recs = build(torch.device("cuda", i), select=False)  # engine start never selects: cache or F.linear
     need = 0
-    for (M, N, K), r in recs.items():
+    for (M, N, K, bias), r in recs.items():
         row = None if r is None or r.get("row") is None else torch.tensor(r["row"], dtype=torch.int64)
-        _table[(i, M, N, K)] = row
+        _table[(i, M, N, K, bias)] = row
         if row is not None:
-            lt.prepare(M, N, K)
+            lt.prepare(M, N, K, bias)
             need = max(need, int(row[15]))
     if i not in _ws:
         _ws[i] = torch.empty(max(need, 256), dtype=torch.uint8, device=torch.device("cuda", i))
     _ready.add(i)
     used = sum(1 for k, v in _table.items() if k[0] == i and v is not None)
-    _log(f"table ready on cuda:{i}: {used} of {len(recs)} (M, N, K) entries use cuBLASLt, workspace {need} B")
+    _log(f"table ready on cuda:{i}: {used} of {len(recs)} (M, N, K, bias) entries use cuBLASLt, workspace {need} B")
 
 
-def entry(dev, M, N, K):
-    return _table.get((dev if isinstance(dev, int) else torch.device(dev).index, M, N, K))
+def entry(dev, M, N, K, bias=False):
+    return _table.get((dev if isinstance(dev, int) else torch.device(dev).index, M, N, K, bool(bias)))
 
 
-def gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """y = x @ weight^T for the ON_SHAPES; table entry -> cuBLASLt algo, otherwise F.linear"""
+def gemm(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+    """y = x @ weight^T (+ bias) for the ON_SHAPES; table entry -> cuBLASLt algo (bias in its epilogue), otherwise
+    F.linear"""
     N, K = weight.shape
     i = x.device.index
     if i not in _ready:
         if torch.cuda.is_current_stream_capturing():
             _log("table not ready under graph capture -> F.linear")
-            return F.linear(x, weight)
+            return F.linear(x, weight, bias)
         prepare(x.device)
     # 256-byte alignment: candidates were checked / chosen without CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_*_BYTES, for which
-    # cuBLASLt assumes 256-byte aligned operands (review 2026-11-14)
+    # cuBLASLt assumes 256-byte aligned operands (review 2026-11-14); the bias vector is held to the same rule
     if (x.dtype != torch.float16 or weight.dtype != torch.float16 or not x.is_contiguous()
             or not weight.is_contiguous() or x.data_ptr() % ALIGN or weight.data_ptr() % ALIGN or x.shape[-1] != K):
-        return F.linear(x, weight)
+        return F.linear(x, weight, bias)
+    if bias is not None and (bias.dtype != torch.float16 or bias.dim() != 1 or bias.shape[0] != N
+                             or not bias.is_contiguous() or bias.data_ptr() % ALIGN):
+        return F.linear(x, weight, bias)
     M = x.numel() // K
-    row = _table.get((i, M, N, K))
+    row = _table.get((i, M, N, K, bias is not None))
     if row is None:
-        return F.linear(x, weight)
+        return F.linear(x, weight, bias)
     y = torch.empty((*x.shape[:-1], N), dtype=x.dtype, device=x.device)
     if y.data_ptr() % ALIGN:
-        return F.linear(x, weight)
-    lt.matmul(x.view(M, K), weight, y.view(M, N), row, _ws[i])
+        return F.linear(x, weight, bias)
+    lt.matmul(x.view(M, K), weight, y.view(M, N), row, _ws[i], bias)
     return y
 
 
-def _gemm_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+def _gemm_fake(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
     return x.new_empty((*x.shape[:-1], weight.shape[0]))
 
 
@@ -325,9 +359,9 @@ def register(direct_register_custom_op, target_lib=None, op_name="attpatt_v100_g
 
 def linear(layer, x, weight, bias=None):
     """drop-in for vllm default_unquantized_gemm; the condition is static under torch.compile (weight shape / dtype)"""
-    if (bias is None and x.dtype == torch.float16 and weight.dtype == torch.float16
-            and (weight.shape[1], weight.shape[0]) in ON_SHAPES):
-        return (_op or gemm)(x, weight)
+    if (x.dtype == torch.float16 and weight.dtype == torch.float16
+            and (weight.shape[1], weight.shape[0], bias is not None) in ON_SHAPES):
+        return (_op or gemm)(x, weight, bias)
     return F.linear(x, weight, bias)
 
 
