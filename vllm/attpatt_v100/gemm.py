@@ -139,9 +139,11 @@ def _fp32_partials(row):
 
 def _select(dev, M, N, K):
     """returns the cache record of one problem: row (16 ints) or None, plus the measured times and errors"""
-    g = torch.Generator(device="cpu").manual_seed(M * 1000003 + N * 101 + K)
-    w = (torch.randn(N, K, generator=g) / K ** 0.5).half().to(dev)
-    xs = [torch.randn(M, K, generator=g).half().to(dev) for _ in range(2)]
+    # inputs are drawn on the GPU: a CPU generator took most of the selection time (the N=248320 weight alone is
+    # 1e9 numbers, single-threaded, while the GPU waited; test_gemm_decode 2026-11-15)
+    g = torch.Generator(device=dev).manual_seed(M * 1000003 + N * 101 + K)
+    w = torch.randn(N, K, generator=g, device=dev, dtype=torch.float16) / K ** 0.5
+    xs = [torch.randn(M, K, generator=g, device=dev, dtype=torch.float16) for _ in range(2)]
     refs = [x.float() @ w.float().t() for x in xs]
     x = xs[0]
     y = torch.empty(M, N, dtype=torch.float16, device=dev)
@@ -194,10 +196,12 @@ def _cache_file(dev, cache_dir):
     return os.path.join(cache_dir, "".join(c if c.isalnum() or c in "._-" else "_" for c in name) + ".json")
 
 
-def build(dev, shapes=ON_SHAPES, ms=CAPTURE_MS, cache_dir=None, select=True):
-    """load the cache records of shapes x ms; with select, select (and append to the cache) the missing ones, without
-    select they are None (-> F.linear).  Returns {(M, N, K): record}.  Must not run under CUDA graph capture."""
+def build(dev, shapes=None, ms=CAPTURE_MS, cache_dir=None, select=True):
+    """load the cache records of shapes (default ON_SHAPES, read at call time) x ms; with select, select (and append to
+    the cache) the missing ones, without select they are None (-> F.linear).  Returns {(M, N, K): record}.  Must not run
+    under CUDA graph capture."""
     assert not torch.cuda.is_current_stream_capturing(), "GEMM table selection under graph capture"
+    shapes = ON_SHAPES if shapes is None else shapes
     dev = torch.device(dev)
     path = _cache_file(dev, cache_dir or CACHE_DIR)
     recs = {}
