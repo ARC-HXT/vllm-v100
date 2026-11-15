@@ -6,6 +6,8 @@ import os
 import sys
 import types
 
+import torch
+
 # In symlink mode (VLLM_FLASH_ATTN_SRC_DIR), cute/ is a symlink to the real
 # source tree and its files use `flash_attn.cute.*` imports (not rewritten).
 # Register a virtual `flash_attn` package so those imports resolve.
@@ -30,7 +32,10 @@ from vllm.vllm_flash_attn.flash_attn_interface import (  # noqa: E402
     is_fa_version_supported,
 )
 
-if not (FA2_AVAILABLE or FA3_AVAILABLE):
+# vllm-v100: a CUDA build whose arch list has no FA arch (Volta / Turing only, setup.py) ships no FA
+# kernels; the package must still import (fa_utils imports it on every CUDA build, layers.rotary lives
+# here) and reports FA2 / FA3 as unsupported through is_fa_version_supported.
+if not (FA2_AVAILABLE or FA3_AVAILABLE) and torch.version.cuda is None:
     raise ImportError(
         "vllm.vllm_flash_attn requires the CUDA flash attention extensions "
         "(_vllm_fa2_C or _vllm_fa3_C). On ROCm, use upstream flash_attn."

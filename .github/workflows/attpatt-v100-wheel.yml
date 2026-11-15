@@ -86,7 +86,8 @@ jobs:
         with:
           cuda: '12.8.1'
           linux-local-args: '["--toolkit"]'
-          use-github-cache: 'false'
+          # the ~5 GB local installer took 8m51s to download in run 43702734253; keep it in the Actions cache
+          use-github-cache: 'true'
 
       - name: Install the pinned compiler dependencies
         run: |

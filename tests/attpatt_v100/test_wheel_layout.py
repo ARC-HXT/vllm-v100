@@ -33,7 +33,15 @@ def test_volta_wheel_keeps_flash_attention_python_files():
 
 
 def test_missing_kernels_are_reported_as_unavailable():
+    # Importing the package must work: fa_utils imports it on every CUDA build.
     from vllm.vllm_flash_attn import flash_attn_interface as fa
 
     assert fa.FA2_AVAILABLE is False and fa.FA3_AVAILABLE is False
     assert "_vllm_fa2_C" in fa.FA2_UNAVAILABLE_REASON
+
+
+def test_rotary_module_imports_without_kernels():
+    # RotaryEmbedding.forward_cuda: from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
+    from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
+
+    assert callable(apply_rotary_emb)

@@ -106,8 +106,9 @@ def ReadTargets(log, show_all):
 
     The result is a list of Target objects."""
     header = log.readline()
-    assert header == "# ninja log v5\n", "unrecognized ninja log version {!r}".format(
-        header
+    # v6 / v7 (ninja 1.12 / 1.13) keep v5's five columns; only the mtime unit and hash changed.
+    assert header in ("# ninja log v5\n", "# ninja log v6\n", "# ninja log v7\n"), (
+        "unrecognized ninja log version {!r}".format(header)
     )
     targets_dict = {}
     last_end_seen = 0.0
