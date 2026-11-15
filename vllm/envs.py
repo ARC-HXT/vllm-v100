@@ -2473,8 +2473,6 @@ def compile_factors() -> dict[str, object]:
 
         factors["ATTPATT_V100_GEMM"] = "1"
         factors["ATTPATT_V100_GEMM_SHAPES"] = fingerprint()
-    if os.environ.get("ATTPATT_V100_GDN_PREFILL") == "1":
-        factors["ATTPATT_V100_GDN_PREFILL"] = "1"
 
     ray_noset_env_vars = [
         # Refer to
