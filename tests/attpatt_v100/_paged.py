@@ -29,8 +29,9 @@ def make_batch(lens, seed, cap=CAP, page=PAGE, pool=None,
     return q, kc, vc, bt.cuda(), torch.tensor(lens, dtype=torch.int32).cuda()
 
 
-def reference(q, kc, vc, bt, lens, scale):
-    """fp32 attention of one query token per sequence over its paged KV, 4 query heads per KV head"""
+def reference(q, kc, vc, bt, lens, scale, window=0):
+    """fp32 attention of one query token per sequence over its paged KV, 4 query heads per KV head;
+    window > 0: only the last `window` tokens (vLLM causal sliding window, positions >= len - window)"""
     out = torch.empty(q.shape, dtype=torch.float32, device=q.device)
     hq, d = q.shape[1:]
     page, hkv = kc.shape[1:3]
@@ -40,8 +41,9 @@ def reference(q, kc, vc, bt, lens, scale):
             continue
         nb = (n + page - 1) // page
         blocks = bt[b, :nb].long()
-        k = kc[blocks].reshape(-1, hkv, d)[:n].float()
-        v = vc[blocks].reshape(-1, hkv, d)[:n].float()
+        lo = max(0, n - window) if window > 0 else 0
+        k = kc[blocks].reshape(-1, hkv, d)[lo:n].float()
+        v = vc[blocks].reshape(-1, hkv, d)[lo:n].float()
         qq = q[b].float().view(hkv, hq // hkv, d)
         s = torch.einsum("hgd,thd->hgt", qq, k) * scale
         out[b] = torch.einsum("hgt,thd->hgd", s.softmax(-1), v).reshape(hq, d)

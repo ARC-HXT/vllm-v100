@@ -151,8 +151,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             _attpatt_v100_reserve is not None
             and self.headdim in _attpatt_decode_dims
             and self.num_heads_q == 4 * self.num_heads_kv
-            and not getattr(kv_cache_spec, "sliding_window", None)
-        ):  # split-KV scratch only for eligible groups, before graph capture
+        ):  # split-KV scratch only for eligible groups (sliding-window groups included), before graph capture
             _attpatt_v100_reserve(device, vllm_config.scheduler_config.max_num_seqs, self.num_heads_q,
                                   model_config.max_model_len, self.block_size, head_dim=self.headdim)
 
@@ -739,33 +738,38 @@ class TritonAttentionImpl(AttentionImpl):
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
         q_lo = 0
+        # causal sliding window (decoder: (window - 1, 0)) runs on the split kernel as its last `window` tokens
+        _attpatt_window = self.sliding_window[0] + 1 if self.sliding_window[0] >= 0 else 0
         if _attpatt_v100_decode is not None and (  # attpatt V100 decode / mixed-batch patch
                 key_cache.dtype == torch.float16 and self.alibi_slopes is None
-                and tuple(self.sliding_window) == (-1, -1) and not self.logits_soft_cap and self.sinks is None
+                and (tuple(self.sliding_window) == (-1, -1)
+                     or (self.sliding_window[1] == 0 and _attpatt_v100_reserve is not None))
+                and not self.logits_soft_cap and self.sinks is None
                 and output_scale is None and mm_prefix_range_tensor is None and attn_metadata.rswa_window is None
                 and query.shape[2] in _attpatt_decode_dims and query.shape[1] == 4 * key_cache.shape[2]):
+            _attpatt_kw = {"window": _attpatt_window} if _attpatt_window else {}  # window: split kernel only
             # v0.33 KV layout: key_cache / value_cache are strided views [blocks, page, kv_heads, 128] of the
             # [blocks, kv_heads, page, 2 * 128] cache (the kernel takes strides; head_dim stays contiguous)
             if max_seqlen_q == 1:
                 _attpatt_v100_decode(query[:num_actual_tokens], key_cache, value_cache, output[:num_actual_tokens],
-                                     block_table, seqused_k, self.scale)
+                                     block_table, seqused_k, self.scale, **_attpatt_kw)
                 return output
             nd = getattr(attn_metadata, "attpatt_num_decodes", 0)
             seq_lens_cpu = getattr(attn_metadata, "attpatt_seq_lens_cpu", None)
             if (_attpatt_prefill is not None and seq_lens_cpu is not None and attn_metadata.causal
-                    and query.shape[2] == 128):
+                    and query.shape[2] == 128 and not _attpatt_window):
                 # attpatt V100 prefill patch: decode rows on the CUDA decode kernel, prefill rows on tensor cores
                 qsl_cpu = attn_metadata.attpatt_qsl_cpu
                 if nd > 0:
                     _attpatt_v100_decode(query[:nd], key_cache, value_cache, output[:nd], block_table[:nd],
-                                         seqused_k[:nd], self.scale)
+                                         seqused_k[:nd], self.scale, **_attpatt_kw)
                 _attpatt_prefill(query, key_cache, value_cache, output, block_table, qsl_cpu, seq_lens_cpu, nd,
                                  qsl_cpu.shape[0] - 1, self.scale)
                 return output
             if nd > 0:
                 # rows [0, nd) are decode requests with one query token each: CUDA kernel; the rest: stock kernel
                 _attpatt_v100_decode(query[:nd], key_cache, value_cache, output[:nd], block_table[:nd],
-                                     seqused_k[:nd], self.scale)
+                                     seqused_k[:nd], self.scale, **_attpatt_kw)
                 q_lo = nd
                 cu_seqlens_q = cu_seqlens_q[nd:] - nd
                 seqused_k = seqused_k[nd:]

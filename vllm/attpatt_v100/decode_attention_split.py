@@ -29,7 +29,7 @@ import sys
 import torch
 
 PART, D = 512, 128
-SUPPORTED_HEAD_DIMS = (128, 256)
+SUPPORTED_HEAD_DIMS = (128, 256, 512)
 UNROLL = 8  # PV 16-byte loads in flight per thread (2, 4 or 8 compiled; 8 fastest in the AttPatt benchmark)
 
 QK_GROUP = int(os.environ.get("ATTPATT_V100_QK_GROUP", "8"))
@@ -41,16 +41,23 @@ _SRC = r"""
 #include <cuda_fp16.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cfloat>
+#include <algorithm>
 
 #ifndef ATTPATT_V100_HEAD_DIM
 #define ATTPATT_V100_HEAD_DIM 128
 #endif
 constexpr int G = 4, D = ATTPATT_V100_HEAD_DIM, PART = 512, NT = 128, NW = NT / 32;
-static_assert(D == 128 || D == 256, "validated head dimensions: 128 and 256");
+static_assert(D == 128 || D == 256 || D == 512, "validated head dimensions: 128, 256 and 512");
+#if ATTPATT_V100_QK_GROUP == 1
+static_assert(D <= 256, "D512 uses the cooperative QK only (a whole K row per thread would spill)");
+#endif
 constexpr int TPT = PART / NT;     // QK tokens per thread
 constexpr int VEC = 8;             // halves per 16-byte vector
 constexpr int LPR = D / VEC;       // threads per V row
 constexpr int SLOTS = NT / LPR;    // V rows per block step
+// PV partial rows reduced through shared memory: D128 folds the two V-row slots of a warp with a shuffle and keeps
+// one row per warp; from D256 on a slot spans one (D256) or two (D512) whole warps and keeps one row per slot.
+constexpr int PR = LPR < 32 ? NW : SLOTS;
 
 __device__ __forceinline__ float warp_max(float v) {
   for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));
@@ -81,16 +88,18 @@ __global__ void __launch_bounds__(NT) split_kernel(
     const half* __restrict__ q, const half* __restrict__ kc, const half* __restrict__ vc,
     const int* __restrict__ bt, const int* __restrict__ lens, float scale,
     long s_q0, long s_q1, long s_o0, long s_o1, long s_bt, long s_kb, long s_kp, long s_kh,
-    long s_vb, long s_vp, long s_vh, int page) {
+    long s_vb, long s_vp, long s_vh, int page, int window) {
   const int b = blockIdx.x, h = blockIdx.y, part = blockIdx.z, max_parts = gridDim.z, nq = gridDim.y * G;
   const int L = lens[b];
-  const int start = part * PART;
+  // causal sliding window (vLLM SLIDING_WINDOW): only positions >= L - window; partitions start at the window
+  const int ws = window > 0 ? max(0, L - window) : 0;
+  const int start = ws + part * PART;
   if (start >= L) return;  // no work in this partition (v2)
   const int n = min(PART, L - start);
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   __shared__ __align__(16) float qs[G][D];
-  constexpr int PB = PART * G > NW * G * D ? PART * G : NW * G * D;
-  __shared__ __align__(16) float pbuf[PB];  // probabilities, then [NW][G][D] PV partials
+  constexpr int PB = PART * G > PR * G * D ? PART * G : PR * G * D;
+  __shared__ __align__(16) float pbuf[PB];  // probabilities, then [PR][G][D] PV partials
   __shared__ int blk[PART + 1];
   __shared__ float red[G][NW];
   __shared__ float stat[2][G];
@@ -280,25 +289,26 @@ __global__ void __launch_bounds__(NT) split_kernel(
       if constexpr (LPR == 16) acc[g][e] += __shfl_xor_sync(0xffffffff, acc[g][e], 16);
     }
   __syncthreads();  // pbuf probabilities no longer needed
-  float* pv = pbuf;  // [NW][G][D]
-  if (lane < LPR) {
+  float* pv = pbuf;  // [PR][G][D]
+  const int row = LPR < 32 ? warp : slot;
+  if (LPR >= 32 || lane < LPR) {
 #pragma unroll
     for (int g = 0; g < G; ++g) {
-      float4* dst = reinterpret_cast<float4*>(pv + (warp * G + g) * D + c * VEC);
+      float4* dst = reinterpret_cast<float4*>(pv + (row * G + g) * D + c * VEC);
       dst[0] = make_float4(acc[g][0], acc[g][1], acc[g][2], acc[g][3]);
       dst[1] = make_float4(acc[g][4], acc[g][5], acc[g][6], acc[g][7]);
     }
   }
   __syncthreads();
-  const bool single = L <= PART;
+  const bool single = L - ws <= PART;
 #pragma unroll
   for (int g = 0; g < G; ++g) {
-    // D256 has two output columns per thread; each warp already covers a V row.
+    // D256 / D512 have two / four output columns per thread.
 #pragma unroll
     for (int d = tid; d < D; d += NT) {
       float o = 0.f;
 #pragma unroll
-      for (int w = 0; w < NW; ++w) o += pv[(w * G + g) * D + d];
+      for (int w = 0; w < PR; ++w) o += pv[(w * G + g) * D + d];
       const int hq = h * G + g;
       if (single) out[b * s_o0 + hq * s_o1 + d] = __float2half_rn(o);
       else tmp_out[(((long)b * nq + hq) * max_parts + part) * D + d] = o;
@@ -315,12 +325,14 @@ __global__ void __launch_bounds__(NT) split_kernel(
 // were written by split_kernel; empty sequences get zeros)
 __global__ void __launch_bounds__(NT) reduce_kernel(
     half* __restrict__ out, const float* __restrict__ exp_sums, const float* __restrict__ max_logits,
-    const float* __restrict__ tmp_out, const int* __restrict__ seq_lens, long s_o0, long s_o1, int max_num_partitions) {
+    const float* __restrict__ tmp_out, const int* __restrict__ seq_lens, long s_o0, long s_o1, int max_num_partitions,
+    int window) {
   const int num_heads = gridDim.y;
   const int head_idx = blockIdx.y;
   const int seq_idx = blockIdx.x;
   const int seq_len = seq_lens[seq_idx];
-  const int num_partitions = (seq_len + PART - 1) / PART;
+  const int span = window > 0 ? min(seq_len, window) : seq_len;  // tokens attended (split_kernel window start)
+  const int num_partitions = (span + PART - 1) / PART;
   half* out_ptr = out + seq_idx * s_o0 + head_idx * s_o1;
   if (num_partitions == 1) return;
   if (num_partitions == 0) {
@@ -384,7 +396,8 @@ __global__ void __launch_bounds__(NT) reduce_kernel(
 }
 
 void decode(torch::Tensor out, torch::Tensor q, torch::Tensor kc, torch::Tensor vc, torch::Tensor bt,
-            torch::Tensor lens, torch::Tensor tmp, torch::Tensor ml, torch::Tensor es, double scale, int64_t unroll) {
+            torch::Tensor lens, torch::Tensor tmp, torch::Tensor ml, torch::Tensor es, double scale, int64_t unroll,
+            int64_t window) {
   TORCH_CHECK(q.scalar_type() == at::kHalf && kc.scalar_type() == at::kHalf && vc.scalar_type() == at::kHalf &&
               out.scalar_type() == at::kHalf, "fp16 only");
   TORCH_CHECK(q.size(2) == D && kc.size(3) == D && vc.size(3) == D && out.size(2) == D,
@@ -405,15 +418,18 @@ void decode(torch::Tensor out, torch::Tensor q, torch::Tensor kc, torch::Tensor 
   TORCH_CHECK(tmp.size(0) >= n && tmp.size(1) == nq && tmp.size(3) == D && tmp.is_contiguous(), "scratch tmp_out");
   TORCH_CHECK(ml.is_contiguous() && es.is_contiguous() && ml.size(2) == parts && es.size(2) == parts, "scratch stats");
   TORCH_CHECK((long)parts * PART >= (long)bt.size(1) * page, "scratch has fewer partitions than the block table");
+  TORCH_CHECK(window >= 0, "window must be >= 0 (0 = full attention)");
   if (n == 0) return;
   auto stream = c10::cuda::getCurrentCUDAStream();
-  dim3 grid(n, hkv, parts);
+  // a window bounds the partitions with work; the grid stays fixed for a given window under CUDA graphs
+  const int launch_parts = window > 0 ? std::min<int>(parts, (int)((window + PART - 1) / PART)) : parts;
+  dim3 grid(n, hkv, launch_parts);
 #define LAUNCH(U)                                                                                                    \
   split_kernel<U><<<grid, NT, 0, stream>>>(                                                                          \
       (half*)out.data_ptr(), tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>(),                      \
       (const half*)q.data_ptr(), (const half*)kc.data_ptr(), (const half*)vc.data_ptr(), bt.data_ptr<int>(),         \
       lens.data_ptr<int>(), (float)scale, q.stride(0), q.stride(1), out.stride(0), out.stride(1), bt.stride(0),      \
-      kc.stride(0), kc.stride(1), kc.stride(2), vc.stride(0), vc.stride(1), vc.stride(2), page)
+      kc.stride(0), kc.stride(1), kc.stride(2), vc.stride(0), vc.stride(1), vc.stride(2), page, (int)window)
   if (unroll == 2) LAUNCH(2);
   else if (unroll == 4) LAUNCH(4);
   else LAUNCH(8);
@@ -421,33 +437,30 @@ void decode(torch::Tensor out, torch::Tensor q, torch::Tensor kc, torch::Tensor 
   dim3 rgrid(n, nq);
   reduce_kernel<<<rgrid, NT, 2 * parts * sizeof(float), stream>>>(
       (half*)out.data_ptr(), es.data_ptr<float>(), ml.data_ptr<float>(), tmp.data_ptr<float>(), lens.data_ptr<int>(),
-      out.stride(0), out.stride(1), parts);
+      out.stride(0), out.stride(1), parts, (int)window);
 }
 """
 _CPP = "void decode(torch::Tensor out, torch::Tensor q, torch::Tensor kc, torch::Tensor vc, torch::Tensor bt, " \
-       "torch::Tensor lens, torch::Tensor tmp, torch::Tensor ml, torch::Tensor es, double scale, int64_t unroll);"
-_mod = None
-_wide_mod = None
+       "torch::Tensor lens, torch::Tensor tmp, torch::Tensor ml, torch::Tensor es, double scale, int64_t unroll, " \
+       "int64_t window);"
+_mods = {}      # head_dim -> compiled module
 _scratch = {}   # device index -> flat fp32 buffer
 _locked = set()  # device indices whose buffer a CUDA graph has captured
 
 
 def _load(head_dim=128):
-    global _mod, _wide_mod
     if head_dim not in SUPPORTED_HEAD_DIMS:
-        raise ValueError("split decode supports head dimensions 128 and 256")
-    mod = _mod if head_dim == 128 else _wide_mod
+        raise ValueError("split decode supports head dimensions 128, 256 and 512")
+    mod = _mods.get(head_dim)
     if mod is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("call reserve() for the head dimension before CUDA graph capture")
         from torch.utils.cpp_extension import load_inline
-        mod = load_inline(f"attpatt_v100_decode_split_v4_d{head_dim}_qk{QK_GROUP}", cpp_sources=_CPP, cuda_sources=_SRC, functions=["decode"],
-                           extra_cuda_cflags=[f"-DATTPATT_V100_QK_GROUP={QK_GROUP}", f"-DATTPATT_V100_HEAD_DIM={head_dim}", "-O3", "-gencode=arch=compute_70,code=sm_70", "--use_fast_math"],
+        qk = QK_GROUP if head_dim <= 256 else 8  # D512 has no one-thread-per-token QK variant
+        mod = load_inline(f"attpatt_v100_decode_split_v5_d{head_dim}_qk{qk}", cpp_sources=_CPP, cuda_sources=_SRC, functions=["decode"],
+                           extra_cuda_cflags=[f"-DATTPATT_V100_QK_GROUP={qk}", f"-DATTPATT_V100_HEAD_DIM={head_dim}", "-O3", "-gencode=arch=compute_70,code=sm_70", "--use_fast_math"],
                            verbose=False)
-        if head_dim == 128:
-            _mod = mod
-        else:
-            _wide_mod = mod
+        _mods[head_dim] = mod
     return mod
 
 
@@ -492,9 +505,9 @@ def _reset_for_tests():
     _locked.clear()
 
 
-def decode_attention(q, k_cache, v_cache, out, block_table, seq_lens, scale):
-    """q/out [sequences, Q heads, D], KV [blocks, page, KV heads, D], D128/256 FP16; 4 query heads per
-    KV head; one query token per sequence"""
+def decode_attention(q, k_cache, v_cache, out, block_table, seq_lens, scale, window=0):
+    """q/out [sequences, Q heads, D], KV [blocks, page, KV heads, D], D128/256/512 FP16; 4 query heads per
+    KV head; one query token per sequence; window > 0: causal sliding window over the last `window` tokens"""
     head_dim = q.shape[-1]
     mod = _load(head_dim)
     n, nq = q.shape[0], q.shape[1]
@@ -517,5 +530,5 @@ def decode_attention(q, k_cache, v_cache, out, block_table, seq_lens, scale):
         a, b = m * nq * parts * head_dim, m * nq * parts
         mod.decode(out[r0:r0 + m], q[r0:r0 + m], k_cache, v_cache, block_table[r0:r0 + m], seq_lens[r0:r0 + m],
                    buf[:a].view(m, nq, parts, head_dim), buf[a:a + b].view(m, nq, parts), buf[a + b:a + 2 * b].view(m, nq, parts),
-                   float(scale), UNROLL)
+                   float(scale), UNROLL, int(window))
     return out
