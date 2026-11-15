@@ -16,13 +16,8 @@ if not torch.cuda.is_available():
 H, HEADS, KV, D, FF, VOCAB = 256, 4, 2, 64, 512, 1000
 
 
-@pytest.fixture(scope="module")
-def tiny_qwen2(tmp_path_factory):
-    d = tmp_path_factory.mktemp("tiny_qwen2")
-    cfg = dict(architectures=["Qwen2ForCausalLM"], model_type="qwen2", hidden_size=H, num_attention_heads=HEADS,
-               num_key_value_heads=KV, intermediate_size=FF, num_hidden_layers=2, vocab_size=VOCAB,
-               max_position_embeddings=4096, rms_norm_eps=1e-6, rope_theta=10000.0, tie_word_embeddings=False,
-               torch_dtype="bfloat16", hidden_act="silu")
+def _model_dir(tmp_path_factory, name, cfg):
+    d = tmp_path_factory.mktemp(name)
     (d / "config.json").write_text(json.dumps(cfg))
     # a tokenizer next to the config (vLLM loads one for the model config); any small local one will do
     src = "/mnt/6t-disk/models/llm/Qwen/Qwen3-0.6B"
@@ -32,6 +27,34 @@ def tiny_qwen2(tmp_path_factory):
         if os.path.exists(os.path.join(src, f)):
             shutil.copy(os.path.join(src, f), d / f)
     return str(d)
+
+
+@pytest.fixture(scope="module")
+def tiny_qwen2(tmp_path_factory):
+    return _model_dir(tmp_path_factory, "tiny_qwen2", dict(
+        architectures=["Qwen2ForCausalLM"], model_type="qwen2", hidden_size=H, num_attention_heads=HEADS,
+        num_key_value_heads=KV, intermediate_size=FF, num_hidden_layers=2, vocab_size=VOCAB,
+        max_position_embeddings=4096, rms_norm_eps=1e-6, rope_theta=10000.0, tie_word_embeddings=False,
+        torch_dtype="bfloat16", hidden_act="silu"))
+
+
+@pytest.fixture(scope="module")
+def tiny_llama_bias(tmp_path_factory):
+    # attention_bias: qkv_proj and the row-parallel o_proj carry a bias (llama.py bias_o_proj = attention_bias)
+    return _model_dir(tmp_path_factory, "tiny_llama_bias", dict(
+        architectures=["LlamaForCausalLM"], model_type="llama", hidden_size=H, num_attention_heads=HEADS,
+        num_key_value_heads=KV, intermediate_size=FF, num_hidden_layers=2, vocab_size=VOCAB,
+        max_position_embeddings=4096, rms_norm_eps=1e-6, rope_theta=10000.0, tie_word_embeddings=False,
+        attention_bias=True, torch_dtype="bfloat16", hidden_act="silu"))
+
+
+@pytest.fixture(scope="module")
+def tiny_qwen2_tied(tmp_path_factory):
+    return _model_dir(tmp_path_factory, "tiny_qwen2_tied", dict(
+        architectures=["Qwen2ForCausalLM"], model_type="qwen2", hidden_size=H, num_attention_heads=HEADS,
+        num_key_value_heads=KV, intermediate_size=FF, num_hidden_layers=2, vocab_size=VOCAB,
+        max_position_embeddings=4096, rms_norm_eps=1e-6, rope_theta=10000.0, tie_word_embeddings=True,
+        torch_dtype="bfloat16", hidden_act="silu"))
 
 
 def expected(tp):
@@ -49,6 +72,45 @@ def expected(tp):
 def test_tiny_qwen2_shapes_per_tensor_parallel_rank(tiny_qwen2, tp):
     from vllm.attpatt_v100.gemm_shapes import shapes_subprocess
     assert shapes_subprocess(tiny_qwen2, tp) == expected(tp)
+
+
+def test_row_parallel_bias_gives_both_variants_at_tp2(tiny_llama_bias):
+    # rank 0 passes the o_proj bias to the GEMM, ranks >= 1 do not (linear.py: bias_ = None if tp_rank > 0)
+    from vllm.attpatt_v100.gemm_shapes import shapes_subprocess
+    pad = (VOCAB + 63) // 64 * 64
+    o = HEADS * D // 2
+    assert shapes_subprocess(tiny_llama_bias, 2) == sorted({
+        (H, (HEADS + 2 * KV) * D // 2, True), (o, H, True), (o, H, False), (H, 2 * FF // 2, False),
+        (FF // 2, H, False), (H, pad // 2, False)})
+    assert (o, H, False) not in shapes_subprocess(tiny_llama_bias, 1)  # one rank: always with the bias
+
+
+RENAMED = r"""
+import json, sys
+import vllm.model_executor.model_loader.utils as U
+from vllm.attpatt_v100 import gemm_shapes as S
+orig = U.initialize_model
+def renamed(**kw):
+    # qwen2 ties lm_head = model.embed_tokens; drop the embed_tokens name so the shared embedding is only reachable
+    # under another name, as GPT-2's wte or Falcon's word_embeddings are
+    net = orig(**kw)
+    del net.model._modules["embed_tokens"]
+    assert type(net.lm_head).__name__ == "VocabParallelEmbedding"
+    return net
+U.initialize_model = renamed
+print("SHAPES " + json.dumps(S.linear_shapes(sys.argv[1], 1)))
+"""
+
+
+def test_tied_head_found_without_its_name(tiny_qwen2_tied):
+    import subprocess
+    import sys
+    r = subprocess.run([sys.executable, "-c", RENAMED, tiny_qwen2_tied], capture_output=True, text=True,
+                       env=dict(os.environ, CUDA_VISIBLE_DEVICES=""))
+    assert r.returncode == 0, r.stderr[-3000:]
+    shapes = json.loads([x for x in r.stdout.splitlines() if x.startswith("SHAPES ")][-1][7:])
+    pad = (VOCAB + 63) // 64 * 64
+    assert [H, pad, False] in shapes
 
 
 def test_build_cli_selects_the_enumerated_shapes(tiny_qwen2, tmp_path, monkeypatch):

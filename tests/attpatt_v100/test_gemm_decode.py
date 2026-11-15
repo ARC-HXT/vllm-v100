@@ -56,10 +56,18 @@ def table(tmp_path_factory):
 
 
 def data(m, k, n, seed):
+    # fp16 drawn directly: the N=248320 weight in fp32 was 4 GB more peak memory per test process, enough to run
+    # concurrent test workers on one card out of memory (review 2026-11-16)
     rng = torch.Generator(device="cuda").manual_seed(seed)
-    x = torch.randn(m, k, generator=rng, device="cuda").half()
-    w = (torch.randn(n, k, generator=rng, device="cuda") / k**0.5).half()
+    x = torch.randn(m, k, generator=rng, device="cuda", dtype=torch.float16)
+    w = torch.randn(n, k, generator=rng, device="cuda", dtype=torch.float16).div_(k**0.5)
     return x, w
+
+
+def ref_fp32(x, w, rows=16384):
+    """fp32 x @ w^T, in blocks of output columns (each element is still one full-K fp32 dot product)"""
+    xf = x.float()
+    return torch.cat([xf @ blk.float().t() for blk in w.split(rows)], dim=1)
 
 
 @pytest.mark.parametrize("k,n", SHAPES)
@@ -70,7 +78,7 @@ def test_decode_table_and_fp32_reference(k, n, m):
     assert ((k, n, False) in G.ON_SHAPES) == accepted  # catalogue v2: (K, N, bias)
     for seed in (71, 72):
         x, w = data(m, k, n, seed)
-        ref = F.linear(x.float(), w.float())
+        ref = ref_fp32(x, w)
         new = (G.linear(None, x, w).float() - ref).abs()
         old = (F.linear(x, w).float() - ref).abs()
         if G.entry(0, m, n, k) is None:

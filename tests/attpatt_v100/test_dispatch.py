@@ -39,13 +39,13 @@ def T(monkeypatch):
     return T
 
 
-def run(T, hq, hkv, d, nd, prefill, window=None, softcap=None, alibi=False, sinks=False):
+def run(T, hq, hkv, d, nd, prefill, window=None, softcap=None, alibi=False, sinks=False, chunk_lookback=-1):
     """nd one-token decode rows followed by prefill requests [(query length, total length)]; returns the calls"""
     T.calls.clear()
     impl = T.TritonAttentionImpl(num_heads=hq, head_size=d, scale=d ** -0.5, num_kv_heads=hkv,
                                  alibi_slopes=[0.1] * hq if alibi else None, sliding_window=window,
                                  kv_cache_dtype="auto", logits_soft_cap=softcap,
-                                 sinks=torch.zeros(hq) if sinks else None)
+                                 sinks=torch.zeros(hq) if sinks else None, chunk_lookback=chunk_lookback)
     ql = [1] * nd + [q for q, _ in prefill]
     sl = [100 + i for i in range(nd)] + [s for _, s in prefill]
     nb = [(s + PAGE - 1) // PAGE for s in sl]
@@ -118,6 +118,16 @@ def test_sliding_window_layers(T):
     assert names(calls) == ["decode", "triton"] and rows(calls[1]) == 64
 
 
+@pytest.mark.parametrize("hq,hkv", [(32, 8), (8, 4)])  # G4: decode-kernel geometry; G2: not
+def test_chunked_attention_layers_only_run_on_triton(T, hq, hkv):
+    # rnj1 chunked layers (sliding_window w, chunk_lookback 1): the stock kernel's chunk mask
+    # (triton_unified_attention.py chunk_size = window // (lookback + 1)); a plain sliding window would be silently wrong
+    calls = run(T, hq, hkv, 128, nd=2, prefill=[(2048, 3000)], window=1024, chunk_lookback=1)
+    assert names(calls) == ["triton"] and rows(calls[0]) == 2050
+    calls = run(T, hq, hkv, 128, nd=3, prefill=[], window=1024, chunk_lookback=1)
+    assert names(calls) == ["triton"] and calls[0][2]["chunk_lookback"] == 1
+
+
 # ---- the pure rules ----
 
 def test_rules():
@@ -130,7 +140,8 @@ def test_rules():
     assert not D.decode_ok(num_q_heads=28, num_kv_heads=4, head_dim=128, sliding_window=(-1, -1), **dec)
     assert not D.decode_ok(num_q_heads=32, num_kv_heads=8, head_dim=128, sliding_window=(4095, 0),
                            **{**dec, "split_kernel": False})
-    for hd in (64, 96, 128, 256, 512):
+    assert {128, 256, 512} <= set(D.PREFILL_CUTLASS_HEAD_DIMS)
+    for hd in D.PREFILL_CUTLASS_HEAD_DIMS:
         assert D.prefill_ok(kind="cutlass", head_dim=hd, sliding_window=(-1, -1), decode=False, **base)
     assert not D.prefill_ok(kind="cutlass", head_dim=100, sliding_window=(-1, -1), decode=False, **base)
     for bad in (dict(softcap=50.0), dict(alibi=True), dict(sinks=True)):
@@ -139,18 +150,30 @@ def test_rules():
     # flash-attention-v100 keeps its old scope
     assert not D.prefill_ok(kind="flash", head_dim=128, sliding_window=(-1, -1), decode=False, **base)
     assert not D.prefill_ok(kind="flash", head_dim=256, sliding_window=(-1, -1), decode=True, **base)
-    assert D.prefill_kernel(head_dim=256, sliding_window=(511, 0), max_query_len=8192) == "triton"
-    assert D.prefill_kernel(head_dim=512, sliding_window=(-1, -1), max_query_len=8192) == "cutlass"
-    assert D.prefill_kernel(head_dim=128, sliding_window=(1023, 0), max_query_len=8192) == "cutlass"
+    assert D.prefill_kernel(kind="cutlass", head_dim=256, sliding_window=(511, 0), max_query_len=8192) == "triton"
+    assert D.prefill_kernel(kind="cutlass", head_dim=512, sliding_window=(-1, -1), max_query_len=8192) == "cutlass"
+    assert D.prefill_kernel(kind="cutlass", head_dim=128, sliding_window=(1023, 0), max_query_len=8192) == "cutlass"
     # measured crossovers (dispatch.py comments): D128 w1024 from M = 2 x window, small chunks by head dim
-    kern = lambda d, w, m: D.prefill_kernel(head_dim=d, sliding_window=(w - 1, 0) if w else (-1, -1),
-                                           max_query_len=m)
+    kern = lambda d, w, m: D.prefill_kernel(kind="cutlass", head_dim=d,
+                                            sliding_window=(w - 1, 0) if w else (-1, -1), max_query_len=m)
     assert [kern(128, 1024, m) for m in (1024, 2048)] == ["triton", "cutlass"]
     assert [kern(256, 1024, m) for m in (16, 8192)] == ["triton", "triton"]
     assert [kern(128, 4096, m) for m in (64, 128)] == ["triton", "cutlass"]
     assert [kern(128, 0, m) for m in (64, 128)] == ["triton", "cutlass"]
     assert [kern(256, 0, m) for m in (128, 256)] == ["triton", "cutlass"]
     assert kern(512, 0, 16) == "cutlass"
+    assert [kern(96, 0, m) for m in (64, 128)] == ["triton", "cutlass"]
+    assert [kern(80, 0, m) for m in (64, 128)] == ["triton", "cutlass"]
+    assert [kern(64, 0, m) for m in (256, 512)] == ["triton", "cutlass"]
+    assert not D.prefill_ok(kind="cutlass", head_dim=112, sliding_window=(-1, -1), decode=False, **base)
+    # the cutlass-measured thresholds do not apply to flash-attention-v100 (PREFILL=1)
+    assert D.prefill_kernel(kind="flash", head_dim=128, sliding_window=(-1, -1), max_query_len=16) == "flash"
+    # chunked attention: neither kernel
+    chunked = dict(sliding_window=(1023, 0), chunk_lookback=1, **base)
+    assert not D.decode_ok(num_q_heads=32, num_kv_heads=8, head_dim=128, decode_dims=(128,), split_kernel=True,
+                           **chunked)
+    assert not D.prefill_ok(kind="cutlass", head_dim=128, decode=False, **chunked)
+    assert not D.call_ok(kv_fp16=True, output_scale=None, mm_prefix=None, rswa=None, chunk_lookback=1)
 
 
 def test_small_chunks_run_on_triton(T):

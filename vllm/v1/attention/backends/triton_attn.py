@@ -744,7 +744,8 @@ class TritonAttentionImpl(AttentionImpl):
         q_lo = 0
         if _attpatt_v100_decode is not None and _attpatt_dispatch.call_ok(  # attpatt V100 decode / prefill patches
                 kv_fp16=key_cache.dtype == torch.float16, output_scale=output_scale,
-                mm_prefix=mm_prefix_range_tensor, rswa=attn_metadata.rswa_window):
+                mm_prefix=mm_prefix_range_tensor, rswa=attn_metadata.rswa_window,
+                chunk_lookback=self.chunk_lookback):
             # decode rows and prefill rows are decided independently (vllm/attpatt_v100/dispatch.py)
             route = self.__dict__.get("_attpatt_route")
             if route is None:
@@ -752,11 +753,12 @@ class TritonAttentionImpl(AttentionImpl):
                     num_q_heads=query.shape[1], num_kv_heads=key_cache.shape[2], head_dim=query.shape[2],
                     sliding_window=tuple(self.sliding_window), softcap=self.logits_soft_cap,
                     alibi=self.alibi_slopes is not None, sinks=self.sinks is not None,
-                    decode_dims=_attpatt_decode_dims, split_kernel=_attpatt_v100_reserve is not None)
+                    decode_dims=_attpatt_decode_dims, split_kernel=_attpatt_v100_reserve is not None,
+                    chunk_lookback=self.chunk_lookback)
                 pre = _attpatt_prefill is not None and _attpatt_dispatch.prefill_ok(
                     kind=_attpatt_prefill_kind, head_dim=query.shape[2], sliding_window=tuple(self.sliding_window),
                     softcap=self.logits_soft_cap, alibi=self.alibi_slopes is not None,
-                    sinks=self.sinks is not None, decode=dec)
+                    sinks=self.sinks is not None, decode=dec, chunk_lookback=self.chunk_lookback)
                 route = self._attpatt_route = (dec, pre, _attpatt_dispatch.window_tokens(tuple(self.sliding_window)))
             dec, pre, window = route
             # causal sliding window (decoder: (window - 1, 0)) runs on the split kernel as its last `window` tokens
@@ -770,9 +772,9 @@ class TritonAttentionImpl(AttentionImpl):
             nd = getattr(attn_metadata, "attpatt_num_decodes", 0)
             seq_lens_cpu = getattr(attn_metadata, "attpatt_seq_lens_cpu", None)
             if (pre and max_seqlen_q > 1 and seq_lens_cpu is not None and attn_metadata.causal
-                    and _attpatt_dispatch.prefill_kernel(head_dim=query.shape[2],
-                                                         sliding_window=tuple(self.sliding_window),
-                                                         max_query_len=max_seqlen_q) == "cutlass"):
+                    and _attpatt_dispatch.prefill_kernel(
+                        kind=_attpatt_prefill_kind, head_dim=query.shape[2],
+                        sliding_window=tuple(self.sliding_window), max_query_len=max_seqlen_q) != "triton"):
                 # attpatt V100 prefill patch: prefill rows on tensor cores; decode rows [0, nd) on the CUDA decode
                 # kernel where it serves the geometry, otherwise on the stock kernel restricted to those rows
                 qsl_cpu = attn_metadata.attpatt_qsl_cpu

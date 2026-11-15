@@ -245,6 +245,15 @@ def _store(path, recs, cache_dir):
         write_catalogue(merged, cache_dir)
 
 
+def _reread(path):
+    """the cache file's records, read under the builders' lock (never between another builder's read and replace)"""
+    from filelock import FileLock
+    if not os.path.exists(path):
+        return {}
+    with FileLock(path + ".lock"):
+        return _read(path)
+
+
 def build(dev, shapes=None, ms=CAPTURE_MS, cache_dir=None, select=True):
     """load the cache records of shapes ((K, N) or (K, N, bias); default ON_SHAPES, read at call time) x ms; with select,
     select (and merge into the cache) the missing ones, without select they are None (-> F.linear).  Returns
@@ -272,6 +281,8 @@ def build(dev, shapes=None, ms=CAPTURE_MS, cache_dir=None, select=True):
                 missing += 1
                 out[k] = None
                 continue
+            if k not in recs:
+                recs.update(_reread(path))  # another builder may have selected it meanwhile
             if k not in recs:
                 if legacy is None:
                     legacy = _read(_cache_file(dev, cache_dir, LEGACY_POLICY))

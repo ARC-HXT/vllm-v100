@@ -80,7 +80,9 @@ def test_prefill_rows_match_the_stock_kernel_on_the_whole_batch(kernel, nd, pre)
 # item 4): Qwen2.5-7B G7, Llama-70B TP8 G8, gemma-3-27b TP4 G2 + window 1024, Qwen3.5 D256, D256 + window 4096,
 # Gemma-4 D512, Mistral-7B window 4096
 GEOMETRIES = [(28, 4, 128, 0), (8, 1, 128, 0), (8, 4, 128, 1024), (16, 4, 256, 0), (8, 2, 256, 4096), (8, 2, 512, 0),
-              (32, 8, 128, 4096)]
+              (32, 8, 128, 4096),
+              # small head dims (review S1): Phi-3-mini D96 MHA, Qwen2-0.5B D64 G7, Phi-2 D80 MHA
+              (32, 32, 96, 0), (14, 2, 64, 0), (32, 32, 80, 0)]
 # fresh prompts (M = L) and later chunks (M < L), windows shorter and longer than the chunk, a page-unaligned window start
 GEOMETRY_CASES = [[(17, 17), (2048, 2048)], [(300, 5000), (1, 1)], [(64, 9001), (1500, 1500)]]
 

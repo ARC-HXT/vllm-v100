@@ -10,10 +10,12 @@ allocated (meta tensors), so a 70B model at TP 8 needs only CPU memory for the m
 
 Rules (vllm/model_executor/layers/linear.py, vocab_parallel_embedding.py):
 - every LinearBase with UnquantizedLinearMethod and an fp16 weight: (K, N) = (weight.shape[1], weight.shape[0]) of this
-  rank's shard; bias when the layer has one and passes it to the GEMM (not skip_bias_add; RowParallelLinear adds it on
-  rank 0, which is the rank enumerated);
-- the logits head: every ParallelLMHead, and with tie_word_embeddings the input embedding named *.embed_tokens
-  (UnquantizedEmbeddingMethod.apply runs the same GEMM).
+  rank's shard; bias when the layer has one and passes it to the GEMM (not skip_bias_add).  RowParallelLinear passes its
+  bias on rank 0 only (linear.py: bias_ = None if tp_rank > 0), so at TP > 1 a row-parallel layer with a bias gives both
+  (K, N, True) and (K, N, False) - shard shapes are the same on every rank;
+- the logits head: every ParallelLMHead, and with tie_word_embeddings every VocabParallelEmbedding with
+  UnquantizedEmbeddingMethod (the tied head runs the embedding's GEMM through UnquantizedEmbeddingMethod.apply; the
+  embedding is not always called embed_tokens: Falcon word_embeddings, GPT-2 wte).
 Run in a subprocess with CUDA_VISIBLE_DEVICES='' (shapes_subprocess) so the GPU stays untouched and the patched global
 state dies with the process.
 usage: python -m vllm.attpatt_v100.gemm_shapes <model dir> [--tp N]  (prints a JSON list of [K, N, bias])"""
@@ -52,7 +54,7 @@ def linear_shapes(model, tp=1, trust_remote_code=False):
 
     from vllm.distributed import parallel_state as ps
     from vllm.engine.arg_utils import EngineArgs
-    from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+    from vllm.model_executor.layers.linear import LinearBase, RowParallelLinear, UnquantizedLinearMethod
     from vllm.model_executor.layers.vocab_parallel_embedding import (
         ParallelLMHead,
         UnquantizedEmbeddingMethod,
@@ -81,16 +83,18 @@ def linear_shapes(model, tp=1, trust_remote_code=False):
         current_platform.__dict__.pop("current_device", None)
     tied = bool(getattr(cfg.model_config.hf_text_config, "tie_word_embeddings", False))
     shapes = set()
-    for name, mod in net.named_modules():
+    for _, mod in net.named_modules():
         w = getattr(mod, "weight", None)
         if not isinstance(w, torch.Tensor) or w.dim() != 2 or w.dtype != torch.float16:
             continue
         bias = getattr(mod, "bias", None) is not None and not getattr(mod, "skip_bias_add", False)
         if isinstance(mod, LinearBase) and isinstance(getattr(mod, "quant_method", None), UnquantizedLinearMethod):
             shapes.add((int(w.shape[1]), int(w.shape[0]), bias))
+            if bias and tp > 1 and isinstance(mod, RowParallelLinear):
+                shapes.add((int(w.shape[1]), int(w.shape[0]), False))  # ranks >= 1
         elif (isinstance(mod, VocabParallelEmbedding)
               and isinstance(getattr(mod, "quant_method", None), UnquantizedEmbeddingMethod)
-              and (isinstance(mod, ParallelLMHead) or (tied and name.split(".")[-1] == "embed_tokens"))):
+              and (isinstance(mod, ParallelLMHead) or tied)):
             shapes.add((int(w.shape[1]), int(w.shape[0]), bias))
     return sorted(shapes)
 
