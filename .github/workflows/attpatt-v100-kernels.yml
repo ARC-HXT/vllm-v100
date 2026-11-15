@@ -36,15 +36,14 @@ jobs:
           sub-packages: '["nvcc", "cudart-dev", "cccl"]'
           use-github-cache: 'false'
 
-      # The kernels include torch/extension.h and c10/cuda headers: the CUDA torch wheel without its dependencies
-      # provides them (the release's torch, attpatt-v100-wheel.yml).
-      - name: Install torch headers and the Python-only vLLM tree
+      # The kernels include torch/extension.h and c10/cuda headers, which the CPU wheel of the release's torch
+      # (2.14.0, attpatt-v100-wheel.yml) ships as well; nothing is linked. The tool loads the kernel modules from
+      # their files, so vLLM itself is not installed.
+      - name: Install torch
         run: |
           uv venv
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
-          uv pip install --no-deps 'torch==2.14.0+cu126' --index-url https://download.pytorch.org/whl/cu126
-          uv pip install numpy typing_extensions sympy filelock jinja2 networkx fsspec
-          echo "PYTHONPATH=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          uv pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cpu
           echo "CUDA_HOME=${{ steps.cuda.outputs.CUDA_PATH }}" >> "$GITHUB_ENV"
 
       - name: Compile every JIT kernel build for sm_70

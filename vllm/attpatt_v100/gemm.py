@@ -196,19 +196,42 @@ def _cache_file(dev, cache_dir):
     return os.path.join(cache_dir, "".join(c if c.isalnum() or c in "._-" else "_" for c in name) + ".json")
 
 
+def _read(path):
+    recs = {}
+    if os.path.exists(path):
+        with open(path) as f:
+            for k, v in json.load(f).items():
+                recs[tuple(int(t) for t in k.split(","))] = v
+    return recs
+
+
+def _store(path, recs, cache_dir):
+    """merge recs into the cache file and rewrite the shape catalogue from the merged records, both under one exclusive
+    lock (path + '.lock'), so builders running at the same time (one per GPU) never drop each other's entries; the
+    selection itself runs outside the lock.  Readers (engines) take no lock: both files are replaced atomically."""
+    from filelock import FileLock
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with FileLock(path + ".lock"):
+        merged = _read(path)
+        merged.update(recs)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            json.dump({",".join(map(str, k)): v for k, v in sorted(merged.items())}, f)
+        os.replace(tmp, path)  # atomic: another process never reads a half-written cache
+        # Engines never select or update dispatch. A fresh worker reads this
+        # static catalogue; algorithm rows still use the device/version key.
+        write_catalogue(merged, cache_dir)
+
+
 def build(dev, shapes=None, ms=CAPTURE_MS, cache_dir=None, select=True):
-    """load the cache records of shapes (default ON_SHAPES, read at call time) x ms; with select, select (and append to
+    """load the cache records of shapes (default ON_SHAPES, read at call time) x ms; with select, select (and merge into
     the cache) the missing ones, without select they are None (-> F.linear).  Returns {(M, N, K): record}.  Must not run
     under CUDA graph capture."""
     assert not torch.cuda.is_current_stream_capturing(), "GEMM table selection under graph capture"
     shapes = ON_SHAPES if shapes is None else shapes
     dev = torch.device(dev)
     path = _cache_file(dev, cache_dir or CACHE_DIR)
-    recs = {}
-    if os.path.exists(path):
-        with open(path) as f:
-            for k, v in json.load(f).items():
-                recs[tuple(int(t) for t in k.split(","))] = v
+    recs = _read(path)
     out, dirty, t0, missing = {}, False, time.time(), 0
     for K, N in shapes:
         for M in ms:
@@ -221,18 +244,12 @@ def build(dev, shapes=None, ms=CAPTURE_MS, cache_dir=None, select=True):
                     recs[(M, N, K)] = _select(dev, M, N, K)
                 dirty = True
                 print(json.dumps(recs[(M, N, K)]), flush=True)
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                tmp = f"{path}.{os.getpid()}.tmp"
-                with open(tmp, "w") as f:
-                    json.dump({",".join(map(str, k)): v for k, v in sorted(recs.items())}, f)
-                os.replace(tmp, path)  # atomic: another process never reads a half-written cache
+                _store(path, {(M, N, K): recs[(M, N, K)]}, cache_dir or CACHE_DIR)
             out[(M, N, K)] = recs[(M, N, K)]
     if dirty:
         _log(f"selected missing entries in {time.time() - t0:.0f} s -> {path}")
-    if select:
-        # Engines never select or update dispatch. A fresh worker reads this
-        # static catalogue; algorithm rows still use the device/version key.
-        write_catalogue(recs, cache_dir or CACHE_DIR)
+    elif select:
+        _store(path, {}, cache_dir or CACHE_DIR)  # the catalogue follows the cache file even when nothing was missing
     if missing:
         _log(f"{missing} (M, N, K) entries missing from {path} -> F.linear for them "
              f"(build the table with: python -m vllm.attpatt_v100.gemm build)")
