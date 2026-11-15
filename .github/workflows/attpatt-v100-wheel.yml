@@ -74,12 +74,39 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             rust/target
-          key: cargo-v1-${{ hashFiles('rust/Cargo.lock', 'rust/**/Cargo.toml') }}
-          restore-keys: cargo-v1-
+          # rust/target does not exist yet when the key is computed
+          key: cargo-v2-${{ hashFiles('rust/**') }}
+          restore-keys: cargo-v2-
+
+      # cargo decides freshness by mtime, and a checkout gives every source file a new one: run
+      # 43711944945 recompiled all workspace crates (192 s) from a restored target. Only on an exact
+      # key hit (same Rust sources as the cached build) are the mtimes moved before that build.
+      - name: Let cargo reuse the cached workspace build
+        if: steps.cargo-restore.outputs.cache-hit == 'true'
+        run: git ls-files -z rust | xargs -0 touch -d @1000000000
+
+      # FetchContent clones about a dozen dependency repositories per configure (~100 s in run
+      # 43711944945). The sources are cached under the hash of the files that pin their versions;
+      # only on an exact hit is CMake told not to contact the remotes.
+      - name: Restore the FetchContent sources
+        id: deps-restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .deps
+            !.deps/*-build
+            !.deps/*-subbuild
+          key: deps-v1-${{ hashFiles('CMakeLists.txt', 'cmake/**') }}
+
+      - name: Use the cached FetchContent sources offline
+        if: steps.deps-restore.outputs.cache-hit == 'true'
+        run: echo "CMAKE_ARGS=-DFETCHCONTENT_FULLY_DISCONNECTED=ON" >> "$GITHUB_ENV"
 
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
         with:
           python-version: '3.13'
+          # UV_NO_CACHE: there is no uv cache to save (its post step failed in run 43711944945)
+          enable-cache: false
 
       - uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
         id: cuda
@@ -169,7 +196,17 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             rust/target
-          key: ${{ job.status == 'success' && steps.cargo-restore.outputs.cache-primary-key || format('cargo-v1-partial-{0}-{1}', github.run_id, github.run_attempt) }}
+          key: ${{ job.status == 'success' && steps.cargo-restore.outputs.cache-primary-key || format('cargo-v2-partial-{0}-{1}', github.run_id, github.run_attempt) }}
+
+      - name: Save the FetchContent sources
+        if: success() && steps.deps-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .deps
+            !.deps/*-build
+            !.deps/*-subbuild
+          key: ${{ steps.deps-restore.outputs.cache-primary-key }}
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()

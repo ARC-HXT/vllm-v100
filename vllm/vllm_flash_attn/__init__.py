@@ -32,9 +32,10 @@ from vllm.vllm_flash_attn.flash_attn_interface import (  # noqa: E402
     is_fa_version_supported,
 )
 
-# vllm-v100: a CUDA build whose arch list has no FA arch (Volta / Turing only, setup.py) ships no FA
-# kernels; the package must still import (fa_utils imports it on every CUDA build, layers.rotary lives
-# here) and reports FA2 / FA3 as unsupported through is_fa_version_supported.
+# vllm-v100: a CUDA build whose arch list has no FA arch (Volta / Turing only,
+# setup.py) ships no FA kernels; the package must still import (fa_utils imports
+# it on every CUDA build, layers.rotary lives here) and reports FA2 / FA3 as
+# unsupported through is_fa_version_supported.
 if not (FA2_AVAILABLE or FA3_AVAILABLE) and torch.version.cuda is None:
     raise ImportError(
         "vllm.vllm_flash_attn requires the CUDA flash attention extensions "

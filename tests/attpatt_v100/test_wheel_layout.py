@@ -41,7 +41,7 @@ def test_missing_kernels_are_reported_as_unavailable():
 
 
 def test_rotary_module_imports_without_kernels():
-    # RotaryEmbedding.forward_cuda: from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
+    # the import RotaryEmbedding.forward_cuda does
     from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
 
     assert callable(apply_rotary_emb)
