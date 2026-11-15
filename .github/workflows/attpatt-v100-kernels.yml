@@ -36,20 +36,26 @@ jobs:
           sub-packages: '["nvcc", "cudart-dev", "cccl"]'
           use-github-cache: 'false'
 
-      # The kernels include torch/extension.h and c10/cuda headers, which the CPU wheel of the release's torch
-      # (2.14.0, attpatt-v100-wheel.yml) ships as well; nothing is linked. The tool loads the kernel modules from
-      # their files, so vLLM itself is not installed.
-      - name: Install torch
+      # The tool imports the kernel modules (CPU torch is enough: it loads them from their files, vLLM is not
+      # installed); the kernels include torch/extension.h and c10/cuda headers, taken from the include/ of the
+      # release's CUDA torch wheel (2.14.0+cu126, attpatt-v100-wheel.yml; the CPU wheel lacks
+      # c10/cuda/impl/cuda_cmake_macros.h). Nothing is linked.
+      - name: Install torch and the CUDA torch headers
         run: |
           uv venv
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
           uv pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cpu
+          uvx pip download --no-deps --only-binary=:all: --python-version 3.13 -d "$RUNNER_TEMP/cuwheel" \
+            'torch==2.14.0+cu126' --index-url https://download.pytorch.org/whl/cu126
+          unzip -q "$RUNNER_TEMP"/cuwheel/torch-*.whl 'torch/include/*' -d "$RUNNER_TEMP/cutorch"
+          rm -rf "$RUNNER_TEMP/cuwheel"
           echo "CUDA_HOME=${{ steps.cuda.outputs.CUDA_PATH }}" >> "$GITHUB_ENV"
 
       - name: Compile every JIT kernel build for sm_70
         run: |
           nvcc --version
-          python tools/attpatt_v100_kernel_matrix.py --out dist/kernel-matrix --jobs "$(nproc)"
+          python tools/attpatt_v100_kernel_matrix.py --out dist/kernel-matrix --jobs "$(nproc)" \
+            --torch-include "$RUNNER_TEMP/cutorch/torch/include"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()

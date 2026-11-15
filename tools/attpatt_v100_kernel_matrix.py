@@ -31,11 +31,14 @@ _REGS = re.compile(r"Used (\d+) registers")
 _SMEM = re.compile(r"(\d+) bytes smem")
 
 
-def nvcc_command(src_path, obj_path, flags):
+def nvcc_command(src_path, obj_path, flags, torch_include=None):
     from torch.utils import cpp_extension as ce
-    # torch's own include dirs + the toolkit's (a CPU torch wheel, as on Actions, does not look for CUDA_HOME itself)
+    # torch's include dirs (torch_include: the include/ of a CUDA torch wheel, when the installed torch is the CPU
+    # wheel, which lacks c10/cuda/impl/cuda_cmake_macros.h) + the toolkit's (a CPU torch does not resolve CUDA_HOME)
     cuda_home = os.environ.get("CUDA_HOME") or ce.CUDA_HOME or os.path.dirname(os.path.dirname(shutil.which("nvcc")))
-    includes = ([f"-I{p}" for p in ce.include_paths(device_type="cpu")] + [f"-I{cuda_home}/include"]
+    torch_dirs = ([torch_include, os.path.join(torch_include, "torch", "csrc", "api", "include")] if torch_include
+                  else ce.include_paths(device_type="cpu"))
+    includes = ([f"-I{p}" for p in torch_dirs] + [f"-I{cuda_home}/include"]
                 + [f"-I{sysconfig.get_paths()['include']}"])
     return (["nvcc", "-c", src_path, "-o", obj_path, "-std=c++20", "--compiler-options", "-fPIC",
              "-DTORCH_EXTENSION_NAME=attpatt_matrix", "-DTORCH_API_INCLUDE_EXTENSION_H"]
@@ -72,11 +75,11 @@ def parse_ptxas(text):
     return out
 
 
-def compile_one(module, variant, src, flags, tmp):
+def compile_one(module, variant, src, flags, tmp, torch_include=None):
     base = os.path.join(tmp, f"{module.rsplit('.', 1)[-1]}_{variant}")
     with open(base + ".cu", "w") as f:
         f.write(src)
-    cmd = nvcc_command(base + ".cu", base + ".o", flags)
+    cmd = nvcc_command(base + ".cu", base + ".o", flags, torch_include)
     r = subprocess.run(cmd, capture_output=True, text=True)
     os.remove(base + ".cu")
     if os.path.exists(base + ".o"):
@@ -102,6 +105,7 @@ def main():
     ap.add_argument("--baseline", default=os.path.join(os.path.dirname(__file__), "attpatt_v100_kernel_baseline.json"))
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 1)
     ap.add_argument("--root", default=ROOT, help="directory holding vllm/attpatt_v100 (default: this checkout)")
+    ap.add_argument("--torch-include", help="include/ of a CUDA torch wheel (default: the installed torch's)")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     builds = []
@@ -113,7 +117,7 @@ def main():
         for variant, src, flags in mod.jit_variants():
             builds.append((name, variant, src, flags))
     with tempfile.TemporaryDirectory() as tmp, cf.ThreadPoolExecutor(args.jobs) as pool:
-        results = list(pool.map(lambda b: compile_one(*b, tmp), builds))
+        results = list(pool.map(lambda b: compile_one(*b, tmp, args.torch_include), builds))
     baseline = set()
     if os.path.exists(args.baseline):
         with open(args.baseline) as f:
