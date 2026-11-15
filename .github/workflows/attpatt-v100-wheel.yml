@@ -37,11 +37,10 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      - name: Make room on this disposable runner
+      # No more deleting preinstalled SDKs (83 s): without FA2 / FA3 the build used 28 GB of the
+      # 104 GB that were free after that cleanup in run 43716065064 (/ is 146 GB).
+      - name: Install build tools
         run: |
-          for path in /usr/local/lib/android /usr/share/dotnet /opt/ghc; do
-            if test -d "$path"; then sudo rm -r -- "$path"; fi
-          done
           df -h /
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ccache libnuma-dev
@@ -112,9 +111,13 @@ jobs:
         id: cuda
         with:
           cuda: '12.8.1'
-          linux-local-args: '["--toolkit"]'
-          # the ~5 GB local installer took 8m51s to download in run 43702734253; keep it in the Actions cache
-          use-github-cache: 'true'
+          # Only the compiler, headers and libraries the build links against, from NVIDIA's apt
+          # repository: the full local installer took 215 s to run even from the Actions cache
+          # (run 43716065064).
+          method: network
+          sub-packages: '["nvcc", "cudart-dev", "nvrtc-dev", "nvtx", "cccl", "profiler-api", "driver-dev", "cuobjdump", "cupti-dev"]'
+          non-cuda-sub-packages: '["libcublas-dev", "libcusparse-dev", "libcusolver-dev", "libcurand-dev", "libcufft-dev"]'
+          use-github-cache: 'false'
 
       - name: Install the pinned compiler dependencies
         run: |
