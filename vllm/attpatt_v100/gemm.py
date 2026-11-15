@@ -25,7 +25,10 @@ Scope: legacy Qwen3-4B qkv/down plus accepted offline shapes in shapes.json (cat
 Each (M, N, K, bias) needs a matching device/version record; otherwise it runs F.linear.
 Cache directory: $ATTPATT_V100_GEMM_CACHE, default $VLLM_CACHE_ROOT/attpatt_v100_gemm (~/.cache/vllm/attpatt_v100_gemm).
 CLI: python -m vllm.attpatt_v100.gemm build   (fills the cache for all ON_SHAPES x CAPTURE_MS on cuda:0, about 6 min
-on a V100; one JSON line per entry)"""
+on a V100; one JSON line per entry)
+     python -m vllm.attpatt_v100.gemm build --model <dir> [--model <dir> ...] --tp N [--device i]
+     (the shapes of those models at tensor-parallel size N, enumerated without a GPU; several builders, one per GPU,
+     may share one cache directory)"""
 import json
 import os
 import sys
@@ -365,8 +368,26 @@ def linear(layer, x, weight, bias=None):
     return F.linear(x, weight, bias)
 
 
+def main(argv):
+    import argparse
+    ap = argparse.ArgumentParser(prog="python -m vllm.attpatt_v100.gemm", description="build the GEMM table")
+    ap.add_argument("command", choices=["build"])
+    ap.add_argument("--model", action="append", default=[],
+                    help="model directory (repeatable): select its fp16 GEMM shapes (vllm/attpatt_v100/gemm_shapes.py, "
+                         "enumerated on the meta device without a GPU) instead of the catalogued ones")
+    ap.add_argument("--tp", type=int, default=1, help="tensor-parallel size the shapes are enumerated for")
+    ap.add_argument("--trust-remote-code", action="store_true")
+    ap.add_argument("--device", type=int, default=0, help="CUDA device that selects (default 0)")
+    ap.add_argument("--ms", type=lambda s: [int(x) for x in s.split(",")], default=CAPTURE_MS,
+                    help="comma-separated M values (default: the vLLM capture sizes)")
+    a = ap.parse_args(argv)
+    shapes = None
+    if a.model:
+        from vllm.attpatt_v100.gemm_shapes import shapes_subprocess
+        shapes = sorted({s for m in a.model for s in shapes_subprocess(m, a.tp, a.trust_remote_code)})
+        _log(f"{len(shapes)} shapes (K, N, bias) from {', '.join(a.model)} at TP {a.tp}: {shapes}")
+    build(torch.device("cuda", a.device), shapes=shapes, ms=a.ms)
+
+
 if __name__ == "__main__":
-    if sys.argv[1:] == ["build"]:
-        build(torch.device("cuda", 0))
-    else:
-        sys.exit(__doc__)
+    main(sys.argv[1:])
