@@ -118,6 +118,19 @@ def test_bias_fallbacks_are_bitwise_stock():
     assert torch.equal(G.linear(None, x, w, wide[:, 0]), F.linear(x, w, wide[:, 0]))
 
 
+def test_bias_custom_op_under_torch_compile():
+    # the custom op's schema takes the optional bias (inferred from gemm's signature)
+    from torch.library import Library
+    from vllm.utils.torch_utils import direct_register_custom_op
+    lib = Library("attpatt_gemm_bias_test", "FRAGMENT")
+    op = G.register(direct_register_custom_op, target_lib=lib, op_name="gemm_bias_test")
+    _, w, b = data(8, 96)
+    f = torch.compile(lambda x: op(x, w, b), dynamic=True, fullgraph=True)
+    for m in (16, 8, 2):
+        x, _, _ = data(m, 97 + m)
+        assert torch.equal(f(x), G.gemm(x, w, b)), m
+
+
 def test_bias_and_plain_records_have_separate_keys(table):
     import json
     files = [f for f in os.listdir(table) if f.endswith(".json") and f != "shapes.json"]
