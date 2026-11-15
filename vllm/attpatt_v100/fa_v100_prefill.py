@@ -1,19 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prefill / recompute rows of TRITON_ATTN on V100 through 1Cat-vLLM's flash-attention-v100 paged prefill kernel
 (Volta tensor cores, reads the paged KV in place), ATTPATT_V100_PREFILL=1 (vllm/v1/attention/backends/triton_attn.py).
-Sources: $ATTPATT_FA_V100_SRC (default /opt/attpatt/src/1cat_fa_v100: include/, kernel/ of
+Sources: $ATTPATT_FA_V100_SRC (required, no default: include/, kernel/ of
 github.com/1CatAI/1Cat-vLLM commit d722fab flash-attention-v100, BSD-3); JIT-built once into TORCH_EXTENSIONS_DIR."""
 import os
 
 import torch
 
-SRC = os.environ.get("ATTPATT_FA_V100_SRC", "/opt/attpatt/src/1cat_fa_v100")
+SRC = os.environ.get("ATTPATT_FA_V100_SRC", "")
 _ext = None
 
 
 def _load():
     global _ext
     if _ext is None:
+        if not SRC:
+            raise RuntimeError("ATTPATT_V100_PREFILL=1 needs ATTPATT_FA_V100_SRC set to the flash-attention-v100 "
+                               "source tree (include/, kernel/)")
         from torch.utils.cpp_extension import load
         here = os.path.dirname(os.path.abspath(__file__))
         _ext = load(

@@ -128,8 +128,8 @@ def test_prefill_2_selects_the_cutlass_path_and_needs_the_mixed_patch():
 
 @needs_cuda
 def test_prefill_1_selects_the_flash_v100_path():
-    src = os.environ.get("ATTPATT_FA_V100_SRC", "/opt/attpatt/src/1cat_fa_v100")
-    if not os.path.isdir(os.path.join(src, "kernel")):
-        pytest.skip(f"1Cat flash-attention-v100 sources not found at {src}")
+    src = os.environ.get("ATTPATT_FA_V100_SRC", "")
+    if not src or not os.path.isdir(os.path.join(src, "kernel")):
+        pytest.skip(f"set ATTPATT_FA_V100_SRC to the 1Cat flash-attention-v100 sources (got {src!r})")
     assert probe({**MIXED_ON, "ATTPATT_V100_PREFILL": "1"}, PREFILL_PROBE)["prefill"] == \
         "vllm.attpatt_v100.fa_v100_prefill"
