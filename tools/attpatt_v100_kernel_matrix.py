@@ -33,7 +33,10 @@ _SMEM = re.compile(r"(\d+) bytes smem")
 
 def nvcc_command(src_path, obj_path, flags):
     from torch.utils import cpp_extension as ce
-    includes = [f"-I{p}" for p in ce.include_paths(device_type="cuda")] + [f"-I{sysconfig.get_paths()['include']}"]
+    # torch's own include dirs + the toolkit's (a CPU torch wheel, as on Actions, does not look for CUDA_HOME itself)
+    cuda_home = os.environ.get("CUDA_HOME") or ce.CUDA_HOME or os.path.dirname(os.path.dirname(shutil.which("nvcc")))
+    includes = ([f"-I{p}" for p in ce.include_paths(device_type="cpu")] + [f"-I{cuda_home}/include"]
+                + [f"-I{sysconfig.get_paths()['include']}"])
     return (["nvcc", "-c", src_path, "-o", obj_path, "-std=c++20", "--compiler-options", "-fPIC",
              "-DTORCH_EXTENSION_NAME=attpatt_matrix", "-DTORCH_API_INCLUDE_EXTENSION_H"]
             + list(ce.COMMON_NVCC_FLAGS) + includes + list(flags) + ["-Xptxas", "-v"])
