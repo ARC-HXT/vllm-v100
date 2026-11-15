@@ -67,6 +67,22 @@ and the separate CPU workflow can run concurrently. V100 kernel/model tests
 require a real GPU and are a separate acceptance step; a hosted CPU runner
 does not establish GPU correctness or performance.
 
+Build speed: `MAX_JOBS` is set per run from the runner (one nvcc job per 4 GiB
+of RAM, capped by cores; `dist/runner.txt`). The ccache directory and the Rust
+build tree are kept in the Actions cache; ccache only replays compiler calls
+with byte-identical inputs, so the wheel is still a full source build. A
+failed or timed-out build saves its partial cache under a run-specific key.
+Each artifact carries `ninja-report.txt` (slowest targets), `ccache-stats.txt`,
+`vmstat.txt` (memory during the compile) and `native-libs.sha256`. Artifacts
+and logs expire after one day (repository setting).
+
+A Volta / Turing-only `TORCH_CUDA_ARCH_LIST` (every entry below 8.0,
+`tools/cuda_arch_targets.py`) does not build the FA2 (sm80+) / FA3 (sm90a)
+kernels, which have no usable arch there; the vllm-flash-attn Python files
+(e.g. `layers/rotary.py`, used by `RotaryEmbedding.forward_cuda`) are still
+installed. Releases up to v100.6 shipped both libraries (about 84 MB) compiled
+for nvcc's default arch; vLLM reports them as unavailable when absent.
+
 Build environments live only on disposable Actions runners. Do not accumulate
 versioned build virtual environments on inference servers. Install a verified
 CI artifact for runtime use; GPU acceptance must use that exact artifact.

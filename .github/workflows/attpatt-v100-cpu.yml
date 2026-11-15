@@ -35,4 +35,4 @@ jobs:
           SETUPTOOLS_SCM_PRETEND_VERSION: 0.33.0
 
       - name: Switch tests (off paths)
-        run: python -m pytest --noconftest -q -rs tests/attpatt_v100/test_switches.py
+        run: python -m pytest --noconftest -q -rs tests/attpatt_v100/test_switches.py tests/attpatt_v100/test_build_targets.py tests/attpatt_v100/test_wheel_layout.py

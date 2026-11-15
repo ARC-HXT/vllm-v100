@@ -12,20 +12,28 @@ concurrency:
   group: v100-wheel-${{ github.ref }}
   cancel-in-progress: true
 
+# Every wheel is a full source build. The ccache directory only replays compiler calls whose
+# inputs are byte-identical (native sources are unchanged from upstream v0.33.0; releases change
+# Python / JIT sources), so release builds after the first one should mostly be cache hits.
 jobs:
   wheel:
     runs-on: ubuntu-22.04
-    timeout-minutes: 180
+    timeout-minutes: 350
     env:
       VLLM_TARGET_DEVICE: cuda
       TORCH_CUDA_ARCH_LIST: '7.0'
       VLLM_VERSION_OVERRIDE: 0.33.0+v100.7
       VLLM_USE_PRECOMPILED: '0'
-      MAX_JOBS: '2'
       NVCC_THREADS: '1'
-      CARGO_BUILD_JOBS: '2'
-      CCACHE_MAXSIZE: 1G
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_NOHASHDIR: 'true'
+      CCACHE_COMPILERCHECK: content
+      CCACHE_MAXSIZE: 5G
+      CARGO_TARGET_DIR: ${{ github.workspace }}/rust/target
       UV_NO_CACHE: '1'
+      # Cache keys: bump the prefix to drop every cache entry.
+      CCACHE_KEY_PREFIX: ccache-v1-sm70-cu12.8.1-torch2.14.0-py313-
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -37,6 +45,37 @@ jobs:
           df -h /
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ccache libnuma-dev
+
+      - name: Fit build parallelism to this runner
+        # One nvcc job per 4 GiB of RAM, capped by cores; the vmstat log of each run checks the budget.
+        run: |
+          mkdir -p dist
+          cores=$(nproc)
+          mem_gib=$(awk '/MemTotal/ {print int($2 / 1048576)}' /proc/meminfo)
+          jobs=$(( mem_gib / 4 )); if [ "$jobs" -gt "$cores" ]; then jobs=$cores; fi; if [ "$jobs" -lt 1 ]; then jobs=1; fi
+          echo "MAX_JOBS=$jobs" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_JOBS=$cores" >> "$GITHUB_ENV"
+          { echo "nproc=$cores mem_gib=$mem_gib MAX_JOBS=$jobs CARGO_BUILD_JOBS=$cores"; free -g; df -h /; } | tee dist/runner.txt
+
+      - name: Restore the compiler cache
+        id: ccache-restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .ccache
+          key: ${{ env.CCACHE_KEY_PREFIX }}${{ hashFiles('CMakeLists.txt', 'cmake/**', 'csrc/**', 'setup.py', 'requirements/build/cuda.txt', 'tools/cuda_arch_targets.py') }}
+          restore-keys: ${{ env.CCACHE_KEY_PREFIX }}
+
+      - name: Restore the Rust build cache
+        id: cargo-restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            rust/target
+          key: cargo-v1-${{ hashFiles('rust/Cargo.lock', 'rust/**/Cargo.toml') }}
+          restore-keys: cargo-v1-
 
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
         with:
@@ -57,22 +96,47 @@ jobs:
           uv pip install 'torch==2.14.0+cu126' --index-url https://download.pytorch.org/whl/cu126
           uv pip install -r requirements/build/cuda.txt --extra-index-url https://download.pytorch.org/whl/cu126 --index-strategy unsafe-best-match
           nvcc --version
+          ccache --zero-stats
 
       - name: Compile the complete wheel from this checkout
+        timeout-minutes: 320
         run: |
-          mkdir -p dist
+          set -o pipefail
+          vmstat -t 5 > dist/vmstat.txt &
+          vmstat_pid=$!
+          start=$(date +%s)
           python -m build --wheel --no-isolation --skip-dependency-check . 2>&1 | tee dist/build.log
-          ccache --show-stats
+          echo "compile_seconds=$(( $(date +%s) - start ))" | tee dist/compile-time.txt
+          kill "$vmstat_pid"
+
+      - name: Keep build timing and cache statistics
+        if: always()
+        run: |
+          ccache --show-stats > dist/ccache-stats.txt 2>&1 || true
+          cat dist/ccache-stats.txt
+          log=$(find build -name .ninja_log -print -quit 2>/dev/null || true)
+          if [ -n "$log" ]; then
+            cp "$log" dist/ninja_log.txt
+            python tools/report_build_time_ninja.py --log-file "$log" > dist/ninja-report.txt 2>&1 || true
+            head -60 dist/ninja-report.txt
+          fi
+          awk 'NR > 2 {if ($4 + 0 > 0 && (min == "" || $4 + 0 < min)) min = $4 + 0} END {print "min_free_kib=" min}' dist/vmstat.txt | tee -a dist/compile-time.txt || true
+          df -h / | tee -a dist/runner.txt
 
       - name: Verify native SM70 code and record provenance
         run: |
           wheel=$(find dist -maxdepth 1 -name '*.whl' -print -quit)
           test -n "$wheel"
-          python -m zipfile -e "$wheel" "$RUNNER_TEMP/v100-wheel-unpack"
-          grep -Fx "Version: $VLLM_VERSION_OVERRIDE" "$RUNNER_TEMP/v100-wheel-unpack/vllm-$VLLM_VERSION_OVERRIDE.dist-info/METADATA"
-          cuobjdump --list-elf "$RUNNER_TEMP/v100-wheel-unpack/vllm/_C.abi3.so" > dist/sm70-elf.txt
-          grep 'sm_70' dist/sm70-elf.txt
-          python -c 'import json,os,sys,torch; print(json.dumps(dict(commit=os.environ["GITHUB_SHA"], run_id=os.environ["GITHUB_RUN_ID"], version=os.environ["VLLM_VERSION_OVERRIDE"], python=sys.version, torch=torch.__version__, torch_cuda=torch.version.cuda, architecture=os.environ["TORCH_CUDA_ARCH_LIST"], source_build=True),indent=2))' > dist/build-info.json
+          unpack="$RUNNER_TEMP/v100-wheel-unpack"
+          python -m zipfile -e "$wheel" "$unpack"
+          grep -Fx "Version: $VLLM_VERSION_OVERRIDE" "$unpack/vllm-$VLLM_VERSION_OVERRIDE.dist-info/METADATA"
+          (cd "$unpack" && find . -name '*.so' -print0 | sort -z | xargs -0 sha256sum) > dist/native-libs.sha256
+          cat dist/native-libs.sha256
+          for lib in vllm/_C_stable_libtorch.abi3.so vllm/_moe_C_stable_libtorch.abi3.so; do
+            cuobjdump --list-elf "$unpack/$lib" > "dist/elf-$(basename "$lib").txt"
+            grep -q 'sm_70' "dist/elf-$(basename "$lib").txt"
+          done
+          python -c 'import json,os,sys,torch; print(json.dumps(dict(commit=os.environ["GITHUB_SHA"], run_id=os.environ["GITHUB_RUN_ID"], version=os.environ["VLLM_VERSION_OVERRIDE"], python=sys.version, torch=torch.__version__, torch_cuda=torch.version.cuda, architecture=os.environ["TORCH_CUDA_ARCH_LIST"], max_jobs=os.environ["MAX_JOBS"], ccache_matched_key="${{ steps.ccache-restore.outputs.cache-matched-key }}", source_build=True),indent=2))' > dist/build-info.json
           nvcc --version > dist/nvcc.txt
           sha256sum dist/*.whl > dist/SHA256SUMS
 
@@ -84,12 +148,32 @@ jobs:
           cp -r tests/attpatt_v100 "$RUNNER_TEMP/v100-wheel-tests/"
           cd "$RUNNER_TEMP/v100-wheel-tests"
           python -c 'import os,vllm; assert vllm.__version__ == os.environ["VLLM_VERSION_OVERRIDE"]; print(vllm.__version__,vllm.__file__)'
-          python -m pytest --noconftest -q -rs attpatt_v100/test_switches.py --junitxml="$GITHUB_WORKSPACE/dist/cpu-tests.xml"
+          python -m pytest --noconftest -q -rs attpatt_v100/test_switches.py attpatt_v100/test_wheel_layout.py --junitxml="$GITHUB_WORKSPACE/dist/cpu-tests.xml"
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      # A cold build that fails or times out still saves what it compiled, under a run-specific key,
+      # so the complete key stays free for the first successful build.
+      - name: Save the compiler cache
+        if: always() && steps.ccache-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .ccache
+          key: ${{ job.status == 'success' && steps.ccache-restore.outputs.cache-primary-key || format('{0}partial-{1}-{2}', env.CCACHE_KEY_PREFIX, github.run_id, github.run_attempt) }}
+
+      - name: Save the Rust build cache
+        if: always() && steps.cargo-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            rust/target
+          key: ${{ job.status == 'success' && steps.cargo-restore.outputs.cache-primary-key || format('cargo-v1-partial-{0}-{1}', github.run_id, github.run_attempt) }}
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: vllm-v100-sm70-cp313-${{ github.sha }}
           path: dist/
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 1
