@@ -140,6 +140,7 @@ __device__ int batch_seglen(const int* __restrict__ lens, int n, int window, int
 __device__ __forceinline__ void seq_segments(int span, int seglen, int P, int& nseg, int& len) {
   nseg = span <= 0 ? 0 : min(P, (span + seglen - 1) / seglen);
   len = nseg ? (span + nseg - 1) / nseg : 0;
+  if (nseg) nseg = (span + len - 1) / len;  // capped at P, rounding up can leave trailing segments empty: drop them
 }
 
 template <int G> __device__ __forceinline__ void store_p(float* pbuf, int t, const float (&a)[G]) {
