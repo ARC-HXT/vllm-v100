@@ -64,6 +64,14 @@ CONFIGS = {  # (head dim class, tensor cores, window) -> (BLOCK_N, num_warps, nu
 # can be faster there (near the bandwidth bound every wasted lane shows)
 BATCH_EDGES = (4, 32)
 RULES = {k + (b,): v + (BLOCKS_PER_SM, MIN_SEG, k[1]) for k, v in CONFIGS.items() for b in range(len(BATCH_EDGES) + 1)}
+# D256 sliding window on tensor cores (Gemma-4 sliding layers; no other supported model has this key): the default rule
+# measured 0.79-0.92x of v100.8's CUDA kernel on 128 x 1024 / 64 x 8192 / 128 mixed. Per bucket, the config with the
+# lowest worst-case ratio to each batch's best over all 7 batches of the full-matrix sweep (AttPatt tools/v100_triton
+# tdecode_tune3.py + tdecode_pick2.py, logs/tdecode-r4v5-g7.jsonl, 2026-11-16): 1x32768 / 4x8192 18.8 / 19.5 us (v100.8
+# 74.1 / 74.2), 16x2048 / 16x32768 39.5 / 39.7 (86.0), 64x8192 108.3 (117.7), 128x1024 207.7 (191.6), mixed 157.7 (169.5)
+RULES.update({(256, True, True, 0): (64, 8, 1, 2, 128, True),
+              (256, True, True, 1): (32, 4, 2, 16, 128, True),
+              (256, True, True, 2): (32, 4, 2, 8, 256, True)})
 
 # tuning hook (AttPatt tools/v100_triton/tdecode_tune2.py): dict with any of block_n / num_warps / num_stages / target / min_seg
 # / use_dot overriding the rules below for every call; None in production
