@@ -12,10 +12,51 @@ contiguous [L, kv_heads, D] tensor and run one call with custom_mask_type 2 (cau
 of an M-token chunk sits at position L - M + i).  GQA without copying K/V: query head h = kv * groups + j is laid out
 as batch j, head kv (a strided view of q), and K/V are broadcast over the batch with stride 0, so the only extra memory
 is the gathered KV of one request (L x 8 heads x 128 x 2 B x 2 = 4 KiB per token: 128 MiB at 32k tokens).
-Runs eagerly (mixed / prefill batches use piecewise CUDA graphs, attention is outside the graph)."""
+Runs eagerly (mixed / prefill batches use piecewise CUDA graphs, attention is outside the graph).
+Full-attention D256 requests of at least dispatch.SPLITD_MIN_QUERY query tokens run on 1Cat-vLLM's sm70 Split-D kernel
+instead (vllm._attpatt_sm70_fa_C, cmake/external_projects/attpatt_sm70_fa.cmake; 2.1-2.4x faster than cutlass at 2k-8k
+tokens, dispatch.py constants), on the same gathered KV."""
 import torch
 
+from vllm.attpatt_v100.dispatch import SPLITD_MIN_QUERY
+
 CAUSAL_FROM_BOTTOM_RIGHT = 2  # PyTorch CustomMaskType
+_splitd = None  # torch.ops._attpatt_sm70_fa_C once loaded, False when the extension is missing
+
+
+def splitd_available():
+    """whether 1Cat-vLLM's Split-D extension loads (an sm70 build of this fork ships it)"""
+    global _splitd
+    if _splitd is None:
+        try:
+            import vllm._attpatt_sm70_fa_C  # noqa: F401  (registers the operators)
+            _splitd = torch.ops._attpatt_sm70_fa_C
+        except ImportError:
+            _splitd = False
+    return _splitd is not False
+
+
+def splitd_attention(q, k, v, out, scale):
+    """q / out [M, Hq, 256], k / v [L, Hkv, 256] fp16, M <= L, causal aligned to the bottom right (query i sees keys
+    0 .. L - M + i).  The kernel takes M % 64 == 0 and L % 32 == 0: K / V get kv_pad = (-L) mod 64 zero keys at the end
+    and q gets front = (L - M) mod 64 zero rows in front and kv_pad zero rows at the end.  Then every real row keeps its
+    keys (row front + i of Mp = front + M + kv_pad sees keys up to Lp - Mp + front + i = L - M + i), only the trailing
+    padding rows see the zero keys, and Mp <= Lp because front <= L - M; the padding rows are dropped."""
+    m, n = q.shape[0], k.shape[0]
+    kv_pad, front = (-n) % 64, (n - m) % 64
+    if kv_pad:
+        k = torch.cat([k, k.new_zeros(kv_pad, *k.shape[1:])])
+        v = torch.cat([v, v.new_zeros(kv_pad, *v.shape[1:])])
+    if front or kv_pad or not q.is_contiguous() or not out.is_contiguous():
+        qp = q.new_zeros(front + m + kv_pad, *q.shape[1:])
+        qp[front:front + m].copy_(q)
+        op = torch.empty_like(qp)
+    else:
+        qp, op = q, out
+    _splitd.splitd_dense_fwd(qp.unsqueeze(0), k.contiguous().unsqueeze(0), v.contiguous().unsqueeze(0),
+                             op.unsqueeze(0), float(scale), True)
+    if op is not out:
+        out.copy_(op[front:front + m])
 
 
 def prefill_attention(query, key_cache, value_cache, output, block_table, query_start_loc_cpu, seq_lens_cpu,
@@ -41,6 +82,9 @@ def prefill_attention(query, key_cache, value_cache, output, block_table, query_
         n = total - lo
         k = key_cache.index_select(0, blocks).reshape((nb - p0) * page, hkv, d)[lo - p0 * page:][:n]
         v = value_cache.index_select(0, blocks).reshape((nb - p0) * page, hkv, d)[lo - p0 * page:][:n]
+        if d == 256 and not window and m >= SPLITD_MIN_QUERY and splitd_available():
+            splitd_attention(query[qs:qe], k, v, output[qs:qe], scale)
+            continue
         # q [M, Hq, D] -> [groups, M, Hkv, D] view; K/V [1, L, Hkv, D] expanded to the batch with stride 0
         q = query[qs:qe].view(m, hkv, groups, d).permute(2, 0, 1, 3)
         out = torch.ops.aten._efficient_attention_forward(

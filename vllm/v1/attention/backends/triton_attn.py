@@ -78,6 +78,7 @@ if _attpatt_mixed and _os.environ.get("ATTPATT_V100_PREFILL") == "1":
     _attpatt_prefill_kind = "flash"
 elif _attpatt_mixed and _os.environ.get("ATTPATT_V100_PREFILL") == "2":
     from vllm.attpatt_v100.prefill_attention import prefill_attention as _attpatt_prefill
+    from vllm.attpatt_v100.prefill_attention import splitd_available as _attpatt_splitd_available
     _attpatt_prefill_kind = "cutlass"
 from vllm.attpatt_v100 import dispatch as _attpatt_dispatch  # pure rules, no CUDA; used only with the patches on
 from vllm.v1.kv_cache_interface import (
@@ -818,7 +819,8 @@ class TritonAttentionImpl(AttentionImpl):
             if (pre and max_seqlen_q > 1 and seq_lens_cpu is not None and attn_metadata.causal
                     and _attpatt_dispatch.prefill_kernel(
                         kind=_attpatt_prefill_kind, head_dim=query.shape[2],
-                        sliding_window=tuple(self.sliding_window), max_query_len=max_seqlen_q) != "triton"):
+                        sliding_window=tuple(self.sliding_window), max_query_len=max_seqlen_q,
+                        splitd=_attpatt_prefill_kind == "cutlass" and _attpatt_splitd_available()) != "triton"):
                 # attpatt V100 prefill patch: prefill rows on tensor cores; decode rows [0, nd) on the CUDA decode
                 # kernel where it serves the geometry, otherwise on the stock kernel restricted to those rows
                 qsl_cpu = attn_metadata.attpatt_qsl_cpu

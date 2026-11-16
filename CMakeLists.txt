@@ -1718,6 +1718,8 @@ if (VLLM_GPU_LANG STREQUAL "CUDA")
     include(cmake/external_projects/flashkda.cmake)
     include(cmake/external_projects/qutlass.cmake)
     include(cmake/external_projects/tml_fa4.cmake)
+    # V100 D256 prefill attention (1Cat-vLLM Split-D); a no-op without sm70 in CUDA_ARCHS
+    include(cmake/external_projects/attpatt_sm70_fa.cmake)
 
     # vllm-flash-attn should be last as it overwrites some CMake functions
     include(cmake/external_projects/vllm_flash_attn.cmake)

@@ -165,7 +165,7 @@ jobs:
           grep -Fx "Version: $VLLM_VERSION_OVERRIDE" "$unpack/vllm-$VLLM_VERSION_OVERRIDE.dist-info/METADATA"
           (cd "$unpack" && find . -name '*.so' -print0 | sort -z | xargs -0 sha256sum) > dist/native-libs.sha256
           cat dist/native-libs.sha256
-          for lib in vllm/_C_stable_libtorch.abi3.so vllm/_moe_C_stable_libtorch.abi3.so; do
+          for lib in vllm/_C_stable_libtorch.abi3.so vllm/_moe_C_stable_libtorch.abi3.so vllm/_attpatt_sm70_fa_C.abi3.so; do
             cuobjdump --list-elf "$unpack/$lib" > "dist/elf-$(basename "$lib").txt"
             grep -q 'sm_70' "dist/elf-$(basename "$lib").txt"
           done

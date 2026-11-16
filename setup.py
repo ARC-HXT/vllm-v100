@@ -1122,6 +1122,7 @@ class precompiled_wheel_utils:
                             "vllm/_C_stable_libtorch.abi3.so",
                             "vllm/_moe_C_stable_libtorch.abi3.so",
                             "vllm/_qutlass_C.abi3.so",
+                            "vllm/_attpatt_sm70_fa_C.abi3.so",
                             "vllm/_flashmla_C.abi3.so",
                             "vllm/_flashmla_extension_C.abi3.so",
                             "vllm/_flashkda_C.abi3.so",
@@ -1612,6 +1613,8 @@ if _is_cuda():
     ext_modules.append(CMakeExtension(name="vllm.fmha_sm100", optional=True))
     # tml-fa4 is copied into an isolated vllm.third_party package.
     ext_modules.append(CMakeExtension(name="vllm.tml_fa4", optional=True))
+    # V100 D256 prefill attention (cmake/external_projects/attpatt_sm70_fa.cmake); only built with sm70 in the arch list
+    ext_modules.append(CMakeExtension(name="vllm._attpatt_sm70_fa_C", optional=True))
 
 if _is_cpu():
     import platform

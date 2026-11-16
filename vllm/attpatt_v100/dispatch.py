@@ -15,7 +15,9 @@ Layers with chunked attention (chunk_lookback != -1, e.g. rnj1: the stock kernel
 are served by neither kernel.  Per-call conditions (fp16 KV, no fused output quantization, no multimodal prefix
 ranges, no R-SWA) apply to both and are checked by the caller with call_ok.
 - prefill_kernel: cutlass or Triton for the prefill rows of one batch, from the head dim, the window and the batch's
-  longest query chunk (constants below; a batch is decided as a whole by its longest chunk)."""
+  longest query chunk (constants below; a batch is decided as a whole by its longest chunk); 'splitd' for full-attention
+  D256 layers when 1Cat-vLLM's Split-D extension is built (vllm/attpatt_v100/prefill_attention.py then runs Split-D for
+  the requests with at least SPLITD_MIN_QUERY query tokens and cutlass for the others)."""
 
 # Rule constants.  Source: tools/v100_triton/prefill_attn_options.py <out> round1 (AttPatt repository), V100 GPU 6,
 # 2026-11-16, output /home/arc/build/triton/impl-r1/work/logs/prefill_round1.json: one request of M query tokens at the
@@ -34,6 +36,11 @@ ranges, no R-SWA) apply to both and are checked by the caller with call_ok.
 #   Triton's everywhere): D96 (Phi-3-mini, 32 q / 32 kv) and D80 (Phi-2, 32 / 32) M = 128 cutlass (2.20 / 1.85,
 #   2.16 / 1.79), M = 64 Triton (1.21 / 1.75, 1.23 / 1.62); D64 (Qwen2-0.5B, 14 q / 2 kv) M = 512 cutlass
 #   (2.32 / 1.70), M = 256 Triton (1.54 / 1.62); M = L = 8192: 1.96x / 1.63x / 1.61x faster on cutlass.
+# - Split-D (1Cat-vLLM's sm70 D256 kernel, vllm._attpatt_sm70_fa_C; AttPatt onecat/pp1/kernel-onecat-all.json, V100
+#   GPU 7, 2026-11-16, Qwen3.5-9B heads 16 q / 4 kv, L = 16384, ms Split-D / Triton / cutlass): M = 8192 (= L) 12.01 (dense)
+#   / 28.80 / 28.56, M = 2048 12.33 / 27.23 / 24.99, M = 256 1.99 / 4.24 / 3.40, M = 128 2.00 / 2.17 / 2.27, M = 64
+#   2.01 / 1.72 / 2.29 (Triton faster); errors = fp16 rounding.  No sliding window (the kernel is full causal only).
+SPLITD_MIN_QUERY = 128
 PREFILL_SHORT_WINDOW = 1024  # windows up to this many tokens: Triton for D >= 256, and for M < 2 x window
 
 # head dims with numeric tests (test_prefill_attention.py GEOMETRIES) and measured thresholds; other multiples of 8 stay
@@ -84,12 +91,15 @@ def call_ok(*, kv_fp16, output_scale, mm_prefix, rswa, chunk_lookback=-1):
             and chunk_lookback == -1)
 
 
-def prefill_kernel(*, kind, head_dim, sliding_window, max_query_len):
-    """'cutlass' or 'triton' for the prefill rows of a batch whose layer is prefill_ok; the window / chunk rules were
-    measured for the cutlass path and apply to it only (kind 'flash' keeps its own scope, prefill_ok)"""
+def prefill_kernel(*, kind, head_dim, sliding_window, max_query_len, splitd=False):
+    """'cutlass', 'splitd' or 'triton' for the prefill rows of a batch whose layer is prefill_ok; the window / chunk rules
+    were measured for the cutlass path and apply to it only (kind 'flash' keeps its own scope, prefill_ok); splitd:
+    whether the Split-D extension is available"""
     if kind != "cutlass":
         return kind
     w = window_tokens(sliding_window)
+    if splitd and head_dim == 256 and not w and max_query_len >= SPLITD_MIN_QUERY:
+        return "splitd"
     if w and w <= PREFILL_SHORT_WINDOW and (head_dim >= 256 or max_query_len < 2 * w):
         return "triton"
     if max_query_len < _min_cutlass_query(head_dim):

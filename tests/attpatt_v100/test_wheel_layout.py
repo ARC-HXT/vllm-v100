@@ -48,3 +48,10 @@ def test_rotary_module_imports_without_kernels():
     from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
 
     assert callable(apply_rotary_emb)
+
+
+def test_volta_wheel_has_the_d256_splitd_prefill_extension():
+    # vllm._attpatt_sm70_fa_C (cmake/external_projects/attpatt_sm70_fa.cmake): 1Cat-vLLM's sm70 Split-D D256 prefill;
+    # without it D256 prefill silently falls back to cutlass at less than half the speed. Presence only: the library
+    # may need the CUDA driver to load (test_prefill_splitd.py imports it and checks the operators on the GPU).
+    assert importlib.util.find_spec("vllm._attpatt_sm70_fa_C") is not None

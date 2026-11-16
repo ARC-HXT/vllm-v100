@@ -166,6 +166,16 @@ def test_rules():
     assert [kern(80, 0, m) for m in (64, 128)] == ["triton", "cutlass"]
     assert [kern(64, 0, m) for m in (256, 512)] == ["triton", "cutlass"]
     assert not D.prefill_ok(kind="cutlass", head_dim=112, sliding_window=(-1, -1), decode=False, **base)
+    # 1Cat-vLLM Split-D (D256, full attention, from SPLITD_MIN_QUERY = 128 query tokens) when its extension is built;
+    # windows and other head dims keep the cutlass / Triton rules, and without the extension nothing changes
+    sd = lambda d, w, m: D.prefill_kernel(kind="cutlass", head_dim=d, sliding_window=(w - 1, 0) if w else (-1, -1),
+                                          max_query_len=m, splitd=True)
+    assert [sd(256, 0, m) for m in (64, 128, 256, 8192)] == ["triton", "splitd", "splitd", "splitd"]
+    assert [sd(256, 1024, 8192), sd(256, 4096, 8192)] == ["triton", "cutlass"]
+    assert [sd(128, 0, 8192), sd(512, 0, 8192)] == ["cutlass", "cutlass"]
+    assert kern(256, 0, 8192) == "cutlass"
+    assert D.prefill_kernel(kind="flash", head_dim=256, sliding_window=(-1, -1), max_query_len=8192,
+                            splitd=True) == "flash"
     # the cutlass-measured thresholds do not apply to flash-attention-v100 (PREFILL=1)
     assert D.prefill_kernel(kind="flash", head_dim=128, sliding_window=(-1, -1), max_query_len=16) == "flash"
     # chunked attention: neither kernel
