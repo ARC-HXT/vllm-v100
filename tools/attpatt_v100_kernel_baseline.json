@@ -1,7 +1,6 @@
 {
- "note": "Gate violations of v0.33.0-v100.7 accepted when the kernel matrix gate was introduced (tools/attpatt_v100_kernel_matrix.py, nvcc 12.8.93, V100 box 2026-11-16): dec_kernel = non-split decode kernel (ATTPATT_V100_SPLIT unset), 72 registers, spill 32/32 B; split_kernel<2> of d128_qk8 = UNROLL 2, compiled but never launched (decode_attention_split.UNROLL = 8), spill 8/16 B. Production builds (split d128/d256/d512 qk8, UNROLL 8) do not spill. Keys use mangled names.",
+ "note": "Gate violations of v0.33.0-v100.7 accepted when the kernel matrix gate was introduced (tools/attpatt_v100_kernel_matrix.py, nvcc 12.8.93, V100 box 2026-11-16): dec_kernel = non-split decode kernel (ATTPATT_V100_SPLIT unset), 72 registers, spill 32/32 B; split_kernel<2> of d128_qk8 = UNROLL 2, compiled but never launched (decode_attention_split.UNROLL = 8), spill 8/16 B. Production builds (split d128/d256/d512 qk8, UNROLL 8) do not spill. Keys use mangled names. Round 2 (2026-11-16): the split module is one build per head dim (G templates x softcap, __launch_bounds__(NT, 2)), no instance spills; the d128_qk8 UNROLL 2 entry is gone with it.",
  "accepted": [
-  ["vllm.attpatt_v100.decode_attention", "decode", "_Z10dec_kernelP6__halfPKS_S2_S2_PKiS4_fllllllllllli"],
-  ["vllm.attpatt_v100.decode_attention_split", "d128_qk8", "_Z12split_kernelILi2EEvP6__halfPfS2_S2_PKS0_S4_S4_PKiS6_flllllllllllii"]
+  ["vllm.attpatt_v100.decode_attention", "decode", "_Z10dec_kernelP6__halfPKS_S2_S2_PKiS4_fllllllllllli"]
  ]
 }

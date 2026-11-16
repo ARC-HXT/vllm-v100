@@ -4,8 +4,9 @@ functions of the layer geometry and the batch, no CUDA, so the rules are unit-te
 
 Two independent decisions (plan 2026-11-16 round 1 item 4; before, the prefill branch sat inside the decode condition
 and so required G4, D128 and no window):
-- decode_ok: the CUDA split / one-block decode kernel can serve the one-token rows (G = 4, a compiled head dim, causal
-  sliding window only with the split kernel, no softcap / alibi / sinks);
+- decode_ok: the CUDA split / one-block decode kernel can serve the one-token rows (split kernel: 1 to 8 query heads
+  per KV head, softcap allowed; one-block kernel: G = 4, no softcap; a compiled head dim, causal sliding window only
+  with the split kernel, no alibi / sinks; plan 2026-11-16 round 2 items 7 and 9);
 - prefill_ok: torch's cutlass memory-efficient attention (vllm/attpatt_v100/prefill_attention.py) can serve the prefill
   rows: causal, head dim in PREFILL_CUTLASS_HEAD_DIMS, full or causal sliding window, no softcap / alibi / sinks (it has
   no softcap: a softcap layer would be computed wrongly, silently).  The 1Cat flash-attention-v100 path keeps its old
@@ -58,10 +59,13 @@ def window_tokens(sliding_window):
 
 
 def decode_ok(*, num_q_heads, num_kv_heads, head_dim, sliding_window, softcap, alibi, sinks, decode_dims,
-              split_kernel, chunk_lookback=-1):
+              split_kernel, chunk_lookback=-1, decode_groups=(4,), decode_softcap=False):
+    """decode_groups: query heads per KV head the kernel serves (split kernel 1-8, padded to a G template; one-block
+    kernel and the QK-group-1 rollback 4); decode_softcap: whether it applies a logit softcap (split kernel)"""
     w = window_tokens(sliding_window)
-    return (w is not None and (w == 0 or split_kernel) and not softcap and not alibi and not sinks
-            and chunk_lookback == -1 and head_dim in decode_dims and num_q_heads == 4 * num_kv_heads)
+    return (w is not None and (w == 0 or split_kernel) and (not softcap or decode_softcap) and not alibi
+            and not sinks and chunk_lookback == -1 and head_dim in decode_dims and num_kv_heads > 0
+            and num_q_heads % num_kv_heads == 0 and num_q_heads // num_kv_heads in decode_groups)
 
 
 def prefill_ok(*, kind, head_dim, sliding_window, softcap, alibi, sinks, decode, chunk_lookback=-1):

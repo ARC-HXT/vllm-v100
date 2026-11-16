@@ -95,3 +95,35 @@ def test_mixed_batch_forward_matches_one_stock_call(T, hq, hkv, d, expect):
     assert not out.isnan().any()
     assert (out[:nd] - ref[:nd]).abs().max().item() < 2e-3
     assert (out[nd:] - ref[nd:]).abs().max().item() < 2e-3
+
+
+@pytest.mark.parametrize("hq,hkv,d,softcap,expect", [(28, 4, 128, 0.0, ["decode", "cutlass"]),
+                                                     (16, 8, 256, 50.0, ["decode", "triton"])])
+def test_round2_groups_and_softcap_forward_matches_one_stock_call(T, monkeypatch, hq, hkv, d, softcap, expect):
+    """plan 2026-11-16 round 2: with the split kernel's capabilities (SUPPORTED_GROUPS, SOFTCAP) G7 decode rows run on
+    the kernel next to a cutlass prefill row, and a Gemma-2-like softcap layer's decode rows run on it with the cap
+    (its prefill rows stay on Triton)"""
+    from vllm.attpatt_v100 import decode_attention_split as S
+    if S.QK_GROUP == 1:
+        pytest.skip("the rollback kernel serves G4 without softcap only")
+    monkeypatch.setattr(T, "_attpatt_decode_groups", S.SUPPORTED_GROUPS)
+    monkeypatch.setattr(T, "_attpatt_decode_softcap", S.SOFTCAP)
+    nd = 3
+    q, kv, bt, ql, sl = batch(hq, hkv, d, nd, [(200, 300)], seed=hq + d + 1)
+    md = metadata(ql, sl, nd, hq, d, bt)
+    impl = T.TritonAttentionImpl(num_heads=hq, head_size=d, scale=d ** -0.5, num_kv_heads=hkv, alibi_slopes=None,
+                                 sliding_window=None, kv_cache_dtype="auto", logits_soft_cap=softcap or None)
+    layer = types.SimpleNamespace(_k_scale=torch.ones(1, device="cuda"), _v_scale=torch.ones(1, device="cuda"),
+                                  _q_scale=torch.ones(1, device="cuda"))
+    out = torch.full_like(q, float("nan"))
+    impl.forward(layer, q, None, None, kv, md, output=out)
+    torch.cuda.synchronize()
+    assert T.calls == expect
+    kc, vc = kv.transpose(1, 2).split(d, dim=-1)
+    ks = torch.ones(1, device="cuda", dtype=torch.float32).expand(len(ql), hkv)
+    ref = torch.empty_like(q)
+    T.unified_attention(q, kc, vc, ref, md.query_start_loc, max(ql), md.seq_lens, max(sl), d ** -0.5, True, (-1, -1),
+                        bt, softcap, None, ks, ks)
+    torch.cuda.synchronize()
+    assert not out.isnan().any()
+    assert (out - ref).abs().max().item() < 2e-3

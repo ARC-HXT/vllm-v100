@@ -54,5 +54,7 @@ def test_every_module_lists_its_builds():
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         variants[path] = [v for v, _, _ in mod.jit_variants()]
-    assert variants["vllm/attpatt_v100/decode_attention_split.py"] == [
-        "d128_qk1", "d128_qk8", "d256_qk1", "d256_qk8", "d512_qk8"]
+    # round 2: one build per head dim holds every G template with and without softcap; the QK-group-1 rollback keeps
+    # the v100.8 builds
+    assert variants["vllm/attpatt_v100/decode_attention_split.py"] == ["d128", "d256", "d512"]
+    assert variants["vllm/attpatt_v100/decode_attention_split_qk1.py"] == ["d128_qk1", "d256_qk1", "d512_qk8"]

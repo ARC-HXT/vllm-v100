@@ -77,7 +77,11 @@ def test_rows_beyond_the_scratch_capacity_are_run_in_chunks():
     S.reserve(q.device, 7, HQ, CAP, PAGE, exact=True)  # only 7 rows fit: 6 chunks
     chunked = S.decode_attention(q, kc, vc, torch.empty_like(q), bt, sl, sc)
     S.reserve(q.device, 256, HQ, CAP, PAGE, exact=True)
-    assert torch.equal(full, chunked)
+    # round 2: the segment length follows the rows of each launch, so chunks may sum in another order (fp32), and
+    # only the fp16 rounding of nearly equal results can differ
+    ref = reference(q, kc, vc, bt, sl, sc)
+    assert (chunked.float() - ref).abs().max().item() < 7.5e-4
+    assert (chunked.float() - full.float()).abs().max().item() <= 2 ** -10
 
 
 def test_cuda_graph_replay_matches_eager_and_never_allocates_in_capture():
@@ -218,9 +222,12 @@ def test_nan_in_unused_slots_and_zero_length_rows(hq, hkv):
     assert (out[0] == 0).all() and (out[9] == 0).all()
 
 
-def test_ratio_not_4_refused():
-    q, kc, vc, bt, sl = build_nan([10, 700], 28, 4, 4, nan=False)
-    with pytest.raises(RuntimeError, match="4 query heads"):
+def test_ratio_above_8_refused():
+    # round 2: 1 to 8 query heads per KV head are served (test_decode_attention_groups.py); the rollback (QK group 1)
+    # keeps G4 only
+    hq = 28 if S.QK_GROUP == 1 else 36
+    q, kc, vc, bt, sl = build_nan([10, 700], hq, 4, 4, nan=False)
+    with pytest.raises(RuntimeError, match="4 query heads" if S.QK_GROUP == 1 else "1 to 8 query heads"):
         S.decode_attention(q, kc, vc, torch.empty_like(q), bt, sl, 0.1)
 
 

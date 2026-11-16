@@ -48,9 +48,13 @@ import os as _os
 _attpatt_v100_decode = None
 _attpatt_v100_reserve = None
 _attpatt_decode_dims = (128,)
+_attpatt_decode_groups = (4,)  # query heads per KV head the decode kernel serves
+_attpatt_decode_softcap = False  # whether it applies a logit softcap
 if _os.environ.get("ATTPATT_V100_DECODE") == "1":  # attpatt V100 decode patch
     if _os.environ.get("ATTPATT_V100_SPLIT") == "1":  # attpatt V100 decode patch: split-KV kernel
         from vllm.attpatt_v100.decode_attention_split import SUPPORTED_HEAD_DIMS as _attpatt_decode_dims
+        from vllm.attpatt_v100.decode_attention_split import SUPPORTED_GROUPS as _attpatt_decode_groups
+        from vllm.attpatt_v100.decode_attention_split import SOFTCAP as _attpatt_decode_softcap
         from vllm.attpatt_v100.decode_attention_split import _load as _attpatt_load, decode_attention as _attpatt_v100_decode
         from vllm.attpatt_v100.decode_attention_split import reserve as _attpatt_v100_reserve
     else:
@@ -120,6 +124,36 @@ class TritonAttentionMetadata:
     rswa_window: int | None = None
 
 
+def _attpatt_decode_geometries(vllm_config, layer_names, num_heads_q, num_heads_kv, head_dim):
+    """(q heads, KV heads, head dim) of every layer of a cache group the V100 decode kernel serves (dispatch.decode_ok
+    with the layer's window, softcap, alibi, sinks and chunking), deduplicated; layers that cannot be looked up are
+    taken with the group's geometry"""
+    from vllm.config import get_layers_from_vllm_config
+    from vllm.model_executor.layers.attention import Attention
+    try:
+        layers = get_layers_from_vllm_config(vllm_config, Attention, layer_names)
+    except Exception:  # noqa: BLE001 - no layer objects (e.g. a builder created without a model)
+        layers = {}
+    out = set()
+    for name in layer_names:
+        impl = getattr(layers.get(name), "impl", None)
+        if not isinstance(impl, TritonAttentionImpl):
+            impl = None
+        hq = impl.num_heads if impl is not None else num_heads_q
+        hkv = impl.num_kv_heads if impl is not None else num_heads_kv
+        hd = impl.head_size if impl is not None else head_dim
+        if _attpatt_dispatch.decode_ok(
+                num_q_heads=hq, num_kv_heads=hkv, head_dim=hd,
+                sliding_window=tuple(impl.sliding_window) if impl is not None else (-1, -1),
+                softcap=impl.logits_soft_cap if impl is not None else 0,
+                alibi=impl is not None and impl.alibi_slopes is not None,
+                sinks=impl is not None and impl.sinks is not None, decode_dims=_attpatt_decode_dims,
+                split_kernel=True, chunk_lookback=impl.chunk_lookback if impl is not None else -1,
+                decode_groups=_attpatt_decode_groups, decode_softcap=_attpatt_decode_softcap):
+            out.add((hq, hkv, hd))
+    return sorted(out)
+
+
 class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
     # Step-dependent fields reference persistent input buffers directly.
@@ -151,13 +185,14 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         # not determine another group's buffers or its split-kernel eligibility.
         self.num_heads_kv = kv_cache_spec.num_kv_heads
         self.headdim = kv_cache_spec.head_size
-        if (
-            _attpatt_v100_reserve is not None
-            and self.headdim in _attpatt_decode_dims
-            and self.num_heads_q == 4 * self.num_heads_kv
-        ):  # split-KV scratch only for eligible groups (sliding-window groups included), before graph capture
-            _attpatt_v100_reserve(device, vllm_config.scheduler_config.max_num_seqs, self.num_heads_q,
-                                  model_config.max_model_len, self.block_size, head_dim=self.headdim)
+        if _attpatt_v100_reserve is not None:
+            # split-KV kernel: build every head dim this group's decode layers run on it and reserve their scratch,
+            # before CUDA graph capture (a cache group can mix sliding / full layers, softcap on / off; one build per
+            # head dim holds every G template with and without softcap, vllm/attpatt_v100/decode_attention_split.py)
+            for hq, hkv, hd in _attpatt_decode_geometries(vllm_config, layer_names, self.num_heads_q,
+                                                          self.num_heads_kv, self.headdim):
+                _attpatt_v100_reserve(device, vllm_config.scheduler_config.max_num_seqs, hq,
+                                      model_config.max_model_len, self.block_size, head_dim=hd, num_kv_heads=hkv)
 
         # Check if CUDA Graphs are enabled for decode
         self.decode_cudagraph_enabled = (
@@ -754,15 +789,19 @@ class TritonAttentionImpl(AttentionImpl):
                     sliding_window=tuple(self.sliding_window), softcap=self.logits_soft_cap,
                     alibi=self.alibi_slopes is not None, sinks=self.sinks is not None,
                     decode_dims=_attpatt_decode_dims, split_kernel=_attpatt_v100_reserve is not None,
-                    chunk_lookback=self.chunk_lookback)
+                    chunk_lookback=self.chunk_lookback, decode_groups=_attpatt_decode_groups,
+                    decode_softcap=_attpatt_decode_softcap)
                 pre = _attpatt_prefill is not None and _attpatt_dispatch.prefill_ok(
                     kind=_attpatt_prefill_kind, head_dim=query.shape[2], sliding_window=tuple(self.sliding_window),
                     softcap=self.logits_soft_cap, alibi=self.alibi_slopes is not None,
                     sinks=self.sinks is not None, decode=dec, chunk_lookback=self.chunk_lookback)
                 route = self._attpatt_route = (dec, pre, _attpatt_dispatch.window_tokens(tuple(self.sliding_window)))
             dec, pre, window = route
-            # causal sliding window (decoder: (window - 1, 0)) runs on the split kernel as its last `window` tokens
+            # causal sliding window (decoder: (window - 1, 0)) runs on the split kernel as its last `window` tokens;
+            # a softcap layer passes its cap (decode_ok admits softcap only for the split kernel)
             _attpatt_kw = {"window": window} if window else {}
+            if self.logits_soft_cap:
+                _attpatt_kw["softcap"] = self.logits_soft_cap
             # v0.33 KV layout: key_cache / value_cache are strided views [blocks, page, kv_heads, D] of the
             # [blocks, kv_heads, page, 2 * D] cache (the kernels take strides; head_dim stays contiguous)
             if dec and max_seqlen_q == 1:

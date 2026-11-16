@@ -21,7 +21,8 @@ import sysconfig
 import tempfile
 
 # loaded from their files (no vllm package import, so the job needs only torch's headers)
-MODULES = ["vllm/attpatt_v100/decode_attention.py", "vllm/attpatt_v100/decode_attention_split.py"]
+MODULES = ["vllm/attpatt_v100/decode_attention.py", "vllm/attpatt_v100/decode_attention_split.py",
+           "vllm/attpatt_v100/decode_attention_split_qk1.py"]
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SMEM_LIMIT = 48 * 1024  # bytes of static shared memory per block on sm70 without opt-in
 
