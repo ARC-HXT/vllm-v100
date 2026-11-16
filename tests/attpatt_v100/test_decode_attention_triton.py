@@ -109,15 +109,17 @@ def test_one_segment_sequences_write_the_output_without_partials():
     # combine kernel skips it; mixed with multi-segment sequences in the same launch, every row exact
     d, g, hkv = 128, 4, 2
     T.reserve("cuda", 8, g * hkv, head_dim=d, num_kv_heads=hkv)
-    buf = T._scratch[torch.cuda.current_device()]
-    tm = T._target(torch.cuda.current_device(), T._rule(d, True, False, 8)[3])
-    a = T._layout(8, g * hkv, d, tm)[1]
+    i = torch.cuda.current_device()
+    buf = T._scratch[i]
     for lens in ([0, 1, 5, 100], [3, 40000, 7, 0, 20000, 2, 1, 9]):
+        # this launch's own rule and scratch layout (both depend on the batch-size bucket): partials are [0, a)
+        _, _, _, per_sm, min_seg, _ = T._rule(d, True, False, len(lens))
+        a = T._layout(len(lens), g * hkv, d, T._target(i, per_sm))[1]
         buf.fill_(float("nan"))
         q, k, v, bt, sl = G.batch(lens, g, d, hkv=hkv, seed=len(lens), cap=40960)
         out = T.decode_attention(q, k, v, torch.empty_like(q), bt, sl, d ** -0.5)
         G.assert_close(out, G.oracle(q, k, v, bt, sl, d ** -0.5))
-        if max(lens) < 128:  # every sequence one segment (MIN_SEG >= 128): no partial written at all
+        if max(lens) <= min_seg:  # every sequence one segment: no partial written at all
             assert buf[:a].isnan().all()
 
 
