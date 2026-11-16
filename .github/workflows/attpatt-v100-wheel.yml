@@ -37,7 +37,7 @@ jobs:
       # Cache keys: bump the prefix to drop every cache entry.
       CCACHE_KEY_PREFIX: ccache-v1-sm70-cu12.8.1-torch2.14.0-py313-
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # No more deleting preinstalled SDKs (83 s): without FA2 / FA3 the build used 28 GB of the
       # 104 GB that were free after that cleanup in run 43716065064 (/ is 146 GB).
