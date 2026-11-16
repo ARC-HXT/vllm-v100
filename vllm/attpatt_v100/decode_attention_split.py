@@ -40,9 +40,11 @@ SUPPORTED_HEAD_DIMS = (128, 256, 512)
 TEMPLATE_GROUPS = (1, 2, 4, 8)
 SUPPORTED_GROUPS = tuple(range(1, 9))  # real query heads per KV head (padded to a template)
 SOFTCAP = True
-# Segment rule constants (AttPatt tools/v100_triton/decode_attn_ab.py sweep, round-2 report): blocks the batch's work is
+# Segment rule constants (AttPatt tools/v100_triton/decode_attn_ab.py sweep, V100 2026-11-16: of BLOCKS_PER_SM 8/16/32 x
+# MIN_SEG 64/128/256 on 8 geometries x 7 batches, 8 / 128 was within 4.3 % of the per-case best on geometric mean, max
+# 41 %; 16 / 128 5.8 %, 32 / 128 6.4 %): blocks the batch's work is
 # spread over, per SM, and the shortest segment.
-BLOCKS_PER_SM = 16
+BLOCKS_PER_SM = 8
 MIN_SEG = 128
 
 QK_GROUP = int(os.environ.get("ATTPATT_V100_QK_GROUP", "8"))
@@ -590,8 +592,8 @@ void decode(torch::Tensor out, torch::Tensor q, torch::Tensor kc, torch::Tensor 
 }
 """
 _CPP = "void decode(torch::Tensor out, torch::Tensor q, torch::Tensor kc, torch::Tensor vc, torch::Tensor bt, " \
-       "torch::Tensor lens, torch::Tensor tmp, torch::Tensor ml, torch::Tensor es, double scale, double softcap, " \
-       "int64_t window, int64_t target, int64_t min_seg);"
+       "torch::Tensor lens, torch::Tensor tmp, torch::Tensor ml, torch::Tensor es, torch::Tensor meta, double scale, " \
+       "double softcap, int64_t window, int64_t target, int64_t min_seg);"
 _mods = {}      # head_dim -> compiled module
 _scratch = {}   # device index -> flat fp32 buffer
 _locked = set()  # device indices whose buffer a CUDA graph has captured

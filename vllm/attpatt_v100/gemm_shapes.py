@@ -21,7 +21,8 @@ Rules (vllm/model_executor/layers/linear.py, vocab_parallel_embedding.py):
   run a GEMM: Gemma-3n / Gemma-4 E embed_tokens_per_layer (vocab x layers * hidden_size_per_layer_input).
 Run in a subprocess with CUDA_VISIBLE_DEVICES='' (shapes_subprocess) so the GPU stays untouched and the patched global
 state dies with the process.
-usage: python -m vllm.attpatt_v100.gemm_shapes <model dir> [--tp N]  (prints a JSON list of [K, N, bias])"""
+usage: python -m vllm.attpatt_v100.gemm_shapes <model dir> [--tp N]  (prints a JSON list of [K, N, bias])
+       python -m vllm.attpatt_v100.gemm_shapes <model dir> [--tp N] --attention  (per-rank attention geometries)"""
 import json
 import os
 import subprocess
@@ -51,18 +52,12 @@ class _Group:
         self.cpu_group = None
 
 
-def linear_shapes(model, tp=1, trust_remote_code=False):
-    """sorted list of (K, N, bias) of the fp16 GEMMs of tensor-parallel rank 0"""
+def rank0_model(model, tp=1, trust_remote_code=False):
+    """(module tree of tensor-parallel rank 0 on the meta device, its VllmConfig)"""
     import torch
 
     from vllm.distributed import parallel_state as ps
     from vllm.engine.arg_utils import EngineArgs
-    from vllm.model_executor.layers.linear import LinearBase, RowParallelLinear, UnquantizedLinearMethod
-    from vllm.model_executor.layers.vocab_parallel_embedding import (
-        ParallelLMHead,
-        UnquantizedEmbeddingMethod,
-        VocabParallelEmbedding,
-    )
     from vllm.model_executor.model_loader.utils import initialize_model
     from vllm.utils.torch_utils import set_default_torch_dtype
 
@@ -84,6 +79,20 @@ def linear_shapes(model, tp=1, trust_remote_code=False):
         for g, v in saved.items():
             setattr(ps, g, v)
         current_platform.__dict__.pop("current_device", None)
+    return net, cfg
+
+
+def linear_shapes(model, tp=1, trust_remote_code=False):
+    """sorted list of (K, N, bias) of the fp16 GEMMs of tensor-parallel rank 0"""
+    import torch
+
+    from vllm.model_executor.layers.linear import LinearBase, RowParallelLinear, UnquantizedLinearMethod
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        ParallelLMHead,
+        UnquantizedEmbeddingMethod,
+        VocabParallelEmbedding,
+    )
+    net, cfg = rank0_model(model, tp, trust_remote_code)
     tied = bool(getattr(cfg.model_config.hf_text_config, "tie_word_embeddings", False))
     head_size = (cfg.model_config.get_vocab_size(), cfg.model_config.get_inputs_embeds_size())
     shapes = set()
@@ -104,15 +113,35 @@ def linear_shapes(model, tp=1, trust_remote_code=False):
     return sorted(shapes)
 
 
-def shapes_subprocess(model, tp=1, trust_remote_code=False):
-    """linear_shapes in a fresh interpreter that sees no GPU"""
+def attention_geometries(model, tp=1, trust_remote_code=False):
+    """sorted distinct (q heads, KV heads, head size, sliding window or 0, softcap or 0.0) of the attention layers of
+    tensor-parallel rank 0: the per-rank values the attention backend sees (the model's own sharding, e.g. qwen2.py
+    num_heads = total // tp, num_kv_heads = max(1, total_kv // tp): KV heads replicated when fewer than tp)"""
+    from vllm.model_executor.layers.attention import Attention
+    net, _ = rank0_model(model, tp, trust_remote_code)
+    out = set()
+    for _, mod in net.named_modules():
+        if isinstance(mod, Attention):
+            cap = getattr(getattr(mod, "impl", None), "logits_soft_cap", None) or 0.0
+            out.add((int(mod.num_heads), int(mod.num_kv_heads), int(mod.head_size), int(mod.sliding_window or 0),
+                     float(cap)))
+    return sorted(out)
+
+
+def shapes_subprocess(model, tp=1, trust_remote_code=False, attention=False):
+    """linear_shapes (or attention_geometries) in a fresh interpreter that sees no GPU"""
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="")
     cmd = [sys.executable, "-m", "vllm.attpatt_v100.gemm_shapes", model, "--tp", str(tp)]
     if trust_remote_code:
         cmd.append("--trust-remote-code")
+    if attention:
+        cmd.append("--attention")
     r = subprocess.run(cmd, env=env, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(f"shape enumeration failed for {model} (tp {tp}):\n{r.stderr[-4000:]}")
+    if attention:
+        line = [x for x in r.stdout.splitlines() if x.startswith("ATTENTION ")][-1]
+        return [tuple(g) for g in json.loads(line[10:])]
     line = [x for x in r.stdout.splitlines() if x.startswith("SHAPES ")][-1]
     return [(k, n, bool(b)) for k, n, b in json.loads(line[7:])]
 
@@ -124,6 +153,10 @@ if __name__ == "__main__":
     ap.add_argument("model")
     ap.add_argument("--tp", type=int, default=1)
     ap.add_argument("--trust-remote-code", action="store_true")
+    ap.add_argument("--attention", action="store_true", help="print the per-rank attention geometries instead")
     a = ap.parse_args()
+    if a.attention:
+        print("ATTENTION " + json.dumps(attention_geometries(a.model, a.tp, a.trust_remote_code)), flush=True)
+        sys.exit(0)
     print("SHAPES " + json.dumps([[k, n, int(b)] for k, n, b in linear_shapes(a.model, a.tp, a.trust_remote_code)]),
           flush=True)

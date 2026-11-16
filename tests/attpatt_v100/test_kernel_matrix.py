@@ -58,3 +58,32 @@ def test_every_module_lists_its_builds():
     # the v100.8 builds
     assert variants["vllm/attpatt_v100/decode_attention_split.py"] == ["d128", "d256", "d512"]
     assert variants["vllm/attpatt_v100/decode_attention_split_qk1.py"] == ["d128_qk1", "d256_qk1", "d512_qk8"]
+
+
+def _params(text):
+    """parameter types of a C++ parameter list: names, const and & dropped"""
+    out = []
+    for p in text.split(","):
+        words = p.replace("&", " ").replace("const ", " ").split()
+        out.append(" ".join(words[:-1]))
+    return out
+
+
+def test_declarations_match_the_cuda_definitions():
+    # load_inline binds the _CPP declaration; a definition with other parameters links to nothing and the import fails
+    # with "undefined symbol" on the GPU only (round 2 work-list kernel: decode gained `meta`, the declaration did not)
+    import re
+    pytest.importorskip("torch")
+    t = _tool()
+    root = Path(importlib.util.find_spec("vllm").submodule_search_locations[0]).parent
+    checked = 0
+    for path in t.MODULES:
+        spec = importlib.util.spec_from_file_location(path, root / path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        for ret, name, params in re.findall(r"(\w+)\s+(\w+)\s*\(([^)]*)\)\s*;", mod._CPP):
+            defs = re.findall(rf"\b{ret}\s+{name}\s*\(([^)]*)\)\s*\{{", mod._SRC)
+            assert len(defs) == 1, (path, name)
+            assert _params(defs[0]) == _params(params), (path, name)
+            checked += 1
+    assert checked == len(t.MODULES)
