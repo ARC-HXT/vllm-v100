@@ -52,11 +52,16 @@ _attpatt_decode_groups = (4,)  # query heads per KV head the decode kernel serve
 _attpatt_decode_softcap = False  # whether it applies a logit softcap
 if _os.environ.get("ATTPATT_V100_DECODE") == "1":  # attpatt V100 decode patch
     if _os.environ.get("ATTPATT_V100_SPLIT") == "1":  # attpatt V100 decode patch: split-KV kernel
-        from vllm.attpatt_v100.decode_attention_split import SUPPORTED_HEAD_DIMS as _attpatt_decode_dims
-        from vllm.attpatt_v100.decode_attention_split import SUPPORTED_GROUPS as _attpatt_decode_groups
-        from vllm.attpatt_v100.decode_attention_split import SOFTCAP as _attpatt_decode_softcap
-        from vllm.attpatt_v100.decode_attention_split import _load as _attpatt_load, decode_attention as _attpatt_v100_decode
-        from vllm.attpatt_v100.decode_attention_split import reserve as _attpatt_v100_reserve
+        # Triton kernel (FMA for small G, tensor cores for large G) unless ATTPATT_V100_SPLIT_IMPL=cuda (rollback)
+        if _os.environ.get("ATTPATT_V100_SPLIT_IMPL", "triton") == "cuda":
+            from vllm.attpatt_v100 import decode_attention_split as _attpatt_split_mod
+        else:
+            from vllm.attpatt_v100 import decode_attention_triton as _attpatt_split_mod
+        _attpatt_decode_dims = _attpatt_split_mod.SUPPORTED_HEAD_DIMS
+        _attpatt_decode_groups = _attpatt_split_mod.SUPPORTED_GROUPS
+        _attpatt_decode_softcap = _attpatt_split_mod.SOFTCAP
+        _attpatt_load, _attpatt_v100_decode = _attpatt_split_mod._load, _attpatt_split_mod.decode_attention
+        _attpatt_v100_reserve = _attpatt_split_mod.reserve
     else:
         from vllm.attpatt_v100.decode_attention import _load as _attpatt_load, decode_attention as _attpatt_v100_decode
     _attpatt_load()  # build / load the extension now, never inside CUDA graph capture

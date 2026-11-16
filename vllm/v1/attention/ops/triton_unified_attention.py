@@ -797,6 +797,9 @@ def reduce_segments(
     tl.store(output_ptr + output_offset, acc, mask=dim_mask)
 
 
+ATTPATT_PREFILL_TUNE = None  # attpatt V100 tuning hook, see unified_attention
+
+
 def _is_gemma3_attention(head_size: int, sliding_window: int) -> bool:
     """Detect Gemma3 models via unique (head_size, sliding_window) signature.
 
@@ -1012,6 +1015,17 @@ def unified_attention(
     # path (used when max_seqlen_q > 1) reads TILE_SIZE_PREFILL.
     if tuned_large_head:
         TILE_SIZE_PREFILL = 128
+
+    # attpatt V100: tuning hook for the prefill (2D) launch (AttPatt tools/v100_triton/prefill_attn_options.py tune):
+    # dict with block_m / tile / num_warps / num_stages, applied when max_seqlen_q > 1; None in production
+    if ATTPATT_PREFILL_TUNE is not None and max_seqlen_q > 1:
+        t = ATTPATT_PREFILL_TUNE
+        BLOCK_M = max(t.get("block_m", BLOCK_M), triton.next_power_of_2(num_queries_per_kv))
+        BLOCK_Q = BLOCK_M // num_queries_per_kv
+        total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
+        TILE_SIZE_PREFILL = t.get("tile", TILE_SIZE_PREFILL)
+        launch_num_warps = t.get("num_warps", launch_num_warps)
+        launch_num_stages = t.get("num_stages", launch_num_stages)
 
     # USE_TD requires BLOCK_SIZE % TILE_SIZE == 0 (enforced by a
     # ``tl.static_assert`` in the kernel).  The default prefill tile

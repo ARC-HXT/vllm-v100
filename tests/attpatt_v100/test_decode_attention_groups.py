@@ -6,6 +6,7 @@ Matrix (plan section 3): query heads per KV head 1-8, D 128 / 256 / 512, window 
 0 / 30 / 50, lengths 0 / 1 / segment and chunk boundaries / 32k / 40k, CUDA graph replay with new lengths and a fixed
 scratch pointer.  Budget: the fp16 rounding of the exact result plus a margin for summation order
 (test_decode_attention_gemma.py).  Needs an sm70 GPU and nvcc."""
+import importlib
 import os
 
 import pytest
@@ -13,11 +14,13 @@ import pytest
 torch = pytest.importorskip("torch")
 if not torch.cuda.is_available():
     pytest.skip("needs a CUDA GPU", allow_module_level=True)
-if os.environ.get("ATTPATT_V100_QK_GROUP", "8") == "1":
-    pytest.skip("the rollback kernel (QK group 1) serves G4 without softcap only", allow_module_level=True)
-
 from tests.attpatt_v100._paged import make_batch  # noqa: E402
-from vllm.attpatt_v100 import decode_attention_split as S  # noqa: E402
+
+# both split kernels behind ATTPATT_V100_SPLIT=1: the Triton kernel (default) and the CUDA one (ATTPATT_V100_SPLIT_IMPL
+# =cuda); the CUDA rollback build (QK group 1) serves G4 without softcap only and is tested elsewhere
+MODULES = {"triton": "vllm.attpatt_v100.decode_attention_triton", "cuda": "vllm.attpatt_v100.decode_attention_split"}
+IMPLS = ["triton"] + ([] if os.environ.get("ATTPATT_V100_QK_GROUP", "8") == "1" else ["cuda"])
+S = None  # the module under test, set per test by the `release` fixture
 
 PAGE = 16
 MARGIN = 2.5e-4
@@ -25,8 +28,10 @@ SHORT = [0, 1, 2, 127, 128, 129, 511, 512, 513, 1023, 1025, 4097]
 LONG = [1, 32768, 40959]
 
 
-@pytest.fixture(autouse=True)
-def release():
+@pytest.fixture(autouse=True, params=IMPLS)
+def release(request):
+    global S
+    S = importlib.import_module(MODULES[request.param])
     S._reset_for_tests()
     yield
     S._reset_for_tests()
@@ -169,7 +174,10 @@ def test_graph_replay_adapts_to_new_lengths(g, d, window, softcap):
         S.reserve(q.device, 100000, q.shape[1], head_dim=d, num_kv_heads=2)
 
 
-def test_more_than_8_query_heads_per_kv_head_is_refused():
+def test_more_query_heads_per_kv_head_than_supported_is_refused():
+    # CUDA kernel: 1 to 8; Triton kernel: 1 to 16
     q, k, v, bt, sl = batch([10, 700], 4, 128, hkv=2, seed=3)
-    with pytest.raises(RuntimeError, match="1 to 8 query heads"):
-        S.decode_attention(q.repeat(1, 3, 1), k, v, torch.empty_like(q.repeat(1, 3, 1)), bt, sl, 0.1)
+    top = S.SUPPORTED_GROUPS[-1]
+    wide = torch.randn(q.shape[0], 2 * (top + 1), 128, dtype=q.dtype, device=q.device)
+    with pytest.raises(RuntimeError, match=f"1 to {top} query heads"):
+        S.decode_attention(wide, k, v, torch.empty_like(wide), bt, sl, 0.1)

@@ -13,7 +13,7 @@ import pytest
 pytestmark = pytest.mark.cpu  # the switch-on cases skip without a GPU + nvcc (needs_cuda)
 
 SWITCHES = ("ATTPATT_V100_DECODE", "ATTPATT_V100_MIXED", "ATTPATT_V100_SPLIT", "ATTPATT_V100_GEMM",
-            "ATTPATT_V100_PREFILL")
+            "ATTPATT_V100_PREFILL", "ATTPATT_V100_SPLIT_IMPL")
 
 PROBE = r"""
 import json
@@ -59,7 +59,10 @@ def test_decode_on_binds_the_cuda_kernel():
 
 @needs_cuda
 def test_split_selects_the_split_kernel_and_its_scratch_reserve():
+    # the Triton kernel by default, the CUDA split kernel with ATTPATT_V100_SPLIT_IMPL=cuda (rollback)
     p = probe({"ATTPATT_V100_DECODE": "1", "ATTPATT_V100_SPLIT": "1"})
+    assert p["decode"] == p["reserve"] == "vllm.attpatt_v100.decode_attention_triton"
+    p = probe({"ATTPATT_V100_DECODE": "1", "ATTPATT_V100_SPLIT": "1", "ATTPATT_V100_SPLIT_IMPL": "cuda"})
     assert p["decode"] == p["reserve"] == "vllm.attpatt_v100.decode_attention_split"
     assert probe({"ATTPATT_V100_DECODE": "1"})["reserve"] is None
     p = probe({"ATTPATT_V100_SPLIT": "1"})  # split alone does nothing
