@@ -64,14 +64,35 @@ CONFIGS = {  # (head dim class, tensor cores, window) -> (BLOCK_N, num_warps, nu
 # can be faster there (near the bandwidth bound every wasted lane shows)
 BATCH_EDGES = (4, 32)
 RULES = {k + (b,): v + (BLOCKS_PER_SM, MIN_SEG, k[1]) for k, v in CONFIGS.items() for b in range(len(BATCH_EDGES) + 1)}
-# D256 sliding window on tensor cores (Gemma-4 sliding layers; no other supported model has this key): the default rule
-# measured 0.79-0.92x of v100.8's CUDA kernel on 128 x 1024 / 64 x 8192 / 128 mixed. Per bucket, the config with the
-# lowest worst-case ratio to each batch's best over all 7 batches of the full-matrix sweep (AttPatt tools/v100_triton
-# tdecode_tune3.py + tdecode_pick2.py, logs/tdecode-r4v5-g7.jsonl, 2026-11-16): 1x32768 / 4x8192 18.8 / 19.5 us (v100.8
-# 74.1 / 74.2), 16x2048 / 16x32768 39.5 / 39.7 (86.0), 64x8192 108.3 (117.7), 128x1024 207.7 (191.6), mixed 157.7 (169.5)
-RULES.update({(256, True, True, 0): (64, 8, 1, 2, 128, True),
-              (256, True, True, 1): (32, 4, 2, 16, 128, True),
-              (256, True, True, 2): (32, 4, 2, 8, 256, True)})
+# Swept rules (AttPatt tools/v100_triton/tdecode_tune3.py full matrix on V100, 2026-11-16: 15 geometries x 7 batches =
+# 105 batches, 72 configs per batch, 144 with the FMA path for G >= 4; logs/tdecode-r4v5-*.jsonl): per key the config with
+# the lowest worst-case ratio to each batch's best among the batches of that key (tdecode_pick2.py). Over the 105 batches:
+# 1.018x the per-batch best (geometric mean; the default rule 1.048x), 1.43x faster than v100.8's kernels, slower on 5
+# (worst 0.86x, Qwen3.5-35B G8 D256 128 x 1024, where the best measured config is 0.87x). Picked on the same batches they are
+# scored on. Keys without sweep data keep the default above.
+RULES.update({
+    (128, False, False, 0): (64, 2, 1, 8, 512, False),
+    (128, False, False, 1): (64, 2, 1, 4, 512, False),
+    (128, False, False, 2): (64, 2, 1, 4, 512, False),
+    (128, True, False, 0): (64, 4, 1, 2, 128, True),
+    (128, True, False, 1): (64, 4, 1, 8, 256, True),
+    (128, True, False, 2): (64, 4, 1, 8, 512, True),
+    (128, True, True, 0): (64, 4, 1, 2, 256, True),
+    (128, True, True, 1): (32, 2, 1, 4, 512, True),
+    (128, True, True, 2): (64, 4, 1, 4, 512, True),
+    (256, False, True, 0): (16, 2, 3, 4, 128, False),
+    (256, False, True, 1): (16, 2, 1, 2, 128, False),
+    (256, False, True, 2): (16, 4, 1, 8, 512, False),
+    (256, True, False, 0): (32, 4, 2, 8, 512, True),
+    (256, True, False, 1): (32, 4, 2, 2, 512, True),
+    (256, True, False, 2): (32, 4, 2, 4, 512, True),
+    (256, True, True, 0): (64, 8, 1, 2, 128, True),
+    (256, True, True, 1): (32, 4, 2, 16, 128, True),
+    (256, True, True, 2): (32, 4, 2, 8, 256, True),
+    (512, True, False, 0): (16, 4, 1, 16, 512, True),
+    (512, True, False, 1): (16, 4, 1, 2, 128, True),
+    (512, True, False, 2): (16, 4, 1, 4, 128, True),
+})
 
 # tuning hook (AttPatt tools/v100_triton/tdecode_tune2.py): dict with any of block_n / num_warps / num_stages / target / min_seg
 # / use_dot overriding the rules below for every call; None in production
