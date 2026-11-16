@@ -3,6 +3,7 @@
 // of github.com/zhinianqin/flash-attention-v100 at c2eda5e with 1Cat-vLLM v1.5.3's five cmake/patches applied; built by
 // cmake/external_projects/attpatt_sm70_fa.cmake). Registration as 1Cat's flash_api_torch_lib.cpp patch does it, under
 // our own extension so vLLM's vllm_flash_attn package stays untouched.
+#include <torch/all.h>
 #include <torch/library.h>
 
 #include "core/registration.h"

@@ -59,12 +59,14 @@ CONFIGS = {  # (head dim class, tensor cores, window) -> (BLOCK_N, num_warps, nu
 }
 # batch-size buckets of the launch rule: rows <= 4, <= 32, > 32 (one CUDA graph per batch size, so the row count is known
 # on the host when the graph is captured); RULES (head dim class, tensor cores, window, bucket) -> (BLOCK_N, num_warps,
-# num_stages, work items per SM, minimum segment)
+# num_stages, work items per SM, minimum segment, tensor cores); the key's tensor-core flag says G >= DOT_MIN_GROUP
+# (eligible), the value's whether the launch uses them: G 4-8 pad to 16 rows on the tensor-core path, and the FMA path
+# can be faster there (near the bandwidth bound every wasted lane shows)
 BATCH_EDGES = (4, 32)
-RULES = {k + (b,): v + (BLOCKS_PER_SM, MIN_SEG) for k, v in CONFIGS.items() for b in range(len(BATCH_EDGES) + 1)}
+RULES = {k + (b,): v + (BLOCKS_PER_SM, MIN_SEG, k[1]) for k, v in CONFIGS.items() for b in range(len(BATCH_EDGES) + 1)}
 
 # tuning hook (AttPatt tools/v100_triton/tdecode_tune2.py): dict with any of block_n / num_warps / num_stages / target / min_seg
-# overriding the rules below for every call; None in production
+# / use_dot overriding the rules below for every call; None in production
 _TUNE = None
 _scratch = {}   # device index -> fp32 buffer
 _rows = {}      # device index -> rows the buffer was reserved for (sets the compile-time batch bound)
@@ -92,8 +94,8 @@ def _plan_kernel(lens_ptr, cum_ptr, seg_ptr, B, window, TARGET, MIN_LEN: tl.cons
 
 
 @triton.jit(do_not_specialize=["sbt", "B", "window"])  # block-table width follows max_model_len: no recompiles
-def _decode_kernel(q_ptr, k_ptr, v_ptr, bt_ptr, lens_ptr, cum_ptr, seg_ptr, pm_ptr, pl_ptr, pacc_ptr,
-                   sqb, sqh, skb, skp, skh, svb, svp, svh, sbt, B, window, scale, softcap,
+def _decode_kernel(q_ptr, k_ptr, v_ptr, bt_ptr, lens_ptr, cum_ptr, seg_ptr, pm_ptr, pl_ptr, pacc_ptr, out_ptr,
+                   sqb, sqh, skb, skp, skh, svb, svp, svh, sbt, sob, soh, B, window, scale, softcap,
                    G: tl.constexpr, GP: tl.constexpr, D: tl.constexpr, DP: tl.constexpr, PAGE: tl.constexpr,
                    BLOCK_N: tl.constexpr, LOGB: tl.constexpr, HAS_WINDOW: tl.constexpr, USE_DOT: tl.constexpr,
                    SOFTCAP: tl.constexpr):
@@ -166,10 +168,17 @@ def _decode_kernel(q_ptr, k_ptr, v_ptr, bt_ptr, lens_ptr, cum_ptr, seg_ptr, pm_p
                 pg = tl.sum(tl.where(rg[:, None] == g, p, 0.0), axis=0)
                 acc = tl.where(rg[:, None] == g, acc + tl.sum(vf * pg[:, None], axis=0)[None, :], acc)
         m_i = m_new
-    row = (w * nh + h) * G + rg  # partial rows: (item, q head)
-    tl.store(pm_ptr + row, m_i, mask=gmask)
-    tl.store(pl_ptr + row, l_i, mask=gmask)
-    tl.store(pacc_ptr + row[:, None] * D + rd[None, :], acc, mask=gmask[:, None] & dmask[None, :])
+    if tl.load(cum_ptr + b) - first == 1:
+        # the sequence is one segment: final output here, no partials (the combine kernel skips it); length 0 gives
+        # l = 0, acc = 0 -> zeros, as the combine kernel writes
+        o = acc / tl.maximum(l_i, 1e-30)[:, None]
+        tl.store(out_ptr + b * sob + (h * G + rg)[:, None] * soh + rd[None, :], o.to(out_ptr.dtype.element_ty),
+                 mask=gmask[:, None] & dmask[None, :])
+    else:
+        row = (w * nh + h) * G + rg  # partial rows: (item, q head)
+        tl.store(pm_ptr + row, m_i, mask=gmask)
+        tl.store(pl_ptr + row, l_i, mask=gmask)
+        tl.store(pacc_ptr + row[:, None] * D + rd[None, :], acc, mask=gmask[:, None] & dmask[None, :])
 
 
 @triton.jit
@@ -186,6 +195,8 @@ def _combine_kernel(cum_ptr, pm_ptr, pl_ptr, pacc_ptr, out_ptr, sob, soh,
     dmask = rd < D
     end = tl.load(cum_ptr + b)
     first = tl.load(cum_ptr + b - 1, mask=b > 0, other=0)
+    if end - first == 1:  # one segment: the decode kernel wrote the output
+        return
     m = tl.max(tl.full([SB], float("-inf"), tl.float32), axis=0)
     l = tl.sum(tl.zeros([SB], tl.float32), axis=0)
     acc = tl.zeros([DP], tl.float32)
@@ -233,7 +244,8 @@ def _bucket(rows):
 
 
 def _rule(head_dim, use_dot, has_window, rows):
-    """(BLOCK_N, num_warps, num_stages, work items per SM, minimum segment) for a launch over `rows` sequences"""
+    """(BLOCK_N, num_warps, num_stages, work items per SM, minimum segment, tensor cores) for a launch over `rows`
+    sequences"""
     d = head_dim if head_dim in (256, 512) else 128
     return RULES[(d, use_dot, has_window, _bucket(rows))]
 
@@ -339,16 +351,17 @@ def decode_attention(q, k_cache, v_cache, out, block_table, seq_lens, scale, win
         raise RuntimeError("Triton split decode scratch too small for one row; call reserve() with the layer geometry")
     # compile-time batch bounds from the reserved rows, so every batch size of a model shares one compilation
     bound = max(_rows.get(i, rows), rows)
-    use_dot = G >= DOT_MIN_GROUP
-    gp = max(16, triton.next_power_of_2(G)) if use_dot else triton.next_power_of_2(G)
+    eligible = G >= DOT_MIN_GROUP
     dp = triton.next_power_of_2(d)
     has_window, has_softcap = bool(window), bool(softcap)
     for r0 in range(0, n, rows):
         m = min(rows, n - r0)
-        bn, nw, ns, per_sm, min_seg = _rule(d, use_dot, has_window, m)
+        bn, nw, ns, per_sm, min_seg, use_dot = _rule(d, eligible, has_window, m)
         if _TUNE:
             bn, nw, ns = _TUNE.get("block_n", bn), _TUNE.get("num_warps", nw), _TUNE.get("num_stages", ns)
-            min_seg = _TUNE.get("min_seg", min_seg)
+            min_seg, use_dot = _TUNE.get("min_seg", min_seg), _TUNE.get("use_dot", use_dot)
+        use_dot = bool(use_dot) and eligible
+        gp = max(16, triton.next_power_of_2(G)) if use_dot else triton.next_power_of_2(G)
         tm = _target(i, per_sm)
         items = tm + m
         _, a, b_, c, e, _ = _layout(m, nq, d, tm)
@@ -358,9 +371,10 @@ def decode_attention(q, k_cache, v_cache, out, block_table, seq_lens, scale, win
         _plan_kernel[(1,)](sl, cum, seg, m, int(window), tm, MIN_LEN=min_seg, BLOCK_N=bn,
                            BP=max(16, triton.next_power_of_2(bound)), HAS_WINDOW=has_window, num_warps=4)
         _decode_kernel[(items, hkv)](
-            qq, k_cache, v_cache, bt, sl, cum, seg, pm, pl, pacc,
+            qq, k_cache, v_cache, bt, sl, cum, seg, pm, pl, pacc, oo,
             qq.stride(0), qq.stride(1), k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
-            v_cache.stride(0), v_cache.stride(1), v_cache.stride(2), bt.stride(0), m, int(window), float(scale),
+            v_cache.stride(0), v_cache.stride(1), v_cache.stride(2), bt.stride(0), oo.stride(0), oo.stride(1), m,
+            int(window), float(scale),
             float(softcap) if has_softcap else 1.0,
             G=G, GP=gp, D=d, DP=dp, PAGE=page, BLOCK_N=bn, LOGB=bound.bit_length() + 1, HAS_WINDOW=has_window,
             USE_DOT=use_dot, SOFTCAP=has_softcap, num_warps=nw, num_stages=ns)

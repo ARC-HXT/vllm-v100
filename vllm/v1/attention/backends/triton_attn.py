@@ -72,6 +72,7 @@ if _attpatt_mixed:
 # paged prefill kernel (JIT), 2 = torch cutlass memory-efficient attention on gathered KV; needs the mixed-batch patch
 _attpatt_prefill = None
 _attpatt_prefill_kind = None  # "flash" (1) or "cutlass" (2): which geometries it serves, vllm/attpatt_v100/dispatch.py
+_attpatt_splitd_available = lambda: False  # noqa: E731 - D256 Split-D prefill: only with the cutlass prefill (2)
 if _attpatt_mixed and _os.environ.get("ATTPATT_V100_PREFILL") == "1":
     from vllm.attpatt_v100.fa_v100_prefill import _load as _attpatt_prefill_load, prefill_attention as _attpatt_prefill
     _attpatt_prefill_load()  # build / load the extension now, never inside CUDA graph capture

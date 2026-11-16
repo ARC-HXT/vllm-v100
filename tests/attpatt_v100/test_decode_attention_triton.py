@@ -78,9 +78,11 @@ def test_reserve_compiles_everything_later_batches_need(g, d):
 def test_batch_size_bucket_rules_compile_at_reserve_and_stay_exact(monkeypatch):
     # the launch rule may differ per batch-size bucket (BATCH_EDGES); reserve() must compile every bucket's kernel
     # shape the reserved rows reach, so no batch size compiles inside CUDA graph capture
+    # (bucket 1 also leaves the tensor cores for the FMA path, a different compiled kernel)
     rules = {}
-    for k, (bn, nw, ns, per_sm, min_seg) in T.RULES.items():
-        rules[k] = {0: (bn, nw, 1, 2, 128), 1: (bn, nw, ns, per_sm, min_seg), 2: (bn, nw, 2, 8, 512)}[k[3]]
+    for k, (bn, nw, ns, per_sm, min_seg, dot) in T.RULES.items():
+        rules[k] = {0: (bn, nw, 1, 2, 128, dot), 1: (16, 2, 1, per_sm, min_seg, False),
+                    2: (bn, nw, 2, 8, 512, dot)}[k[3]]
     monkeypatch.setattr(T, "RULES", rules)
     d, g, hkv = 128, 8, 2
     T.reserve("cuda", 64, g * hkv, head_dim=d, num_kv_heads=hkv)
@@ -92,6 +94,31 @@ def test_batch_size_bucket_rules_compile_at_reserve_and_stay_exact(monkeypatch):
         G.assert_close(T.decode_attention(q, k, v, torch.empty_like(q), bt, sl, d ** -0.5),
                        G.oracle(q, k, v, bt, sl, d ** -0.5))
     assert [compiled(f) for f in kernels] == before
+
+
+@pytest.mark.parametrize("g,d", [(4, 256), (8, 256), (4, 512), (16, 128)])
+def test_fma_path_for_tensor_core_eligible_groups_is_exact(monkeypatch, g, d):
+    # a rule may send G >= DOT_MIN_GROUP to the FMA path (no padding of G to 16 rows)
+    monkeypatch.setattr(T, "_TUNE", {"use_dot": False})
+    check(g, d, G.SHORT + [9000], seed=g + d)
+    check(g, d, [0, 1, 700, 5000], window=1024, softcap=30.0, seed=g + d + 1)
+
+
+def test_one_segment_sequences_write_the_output_without_partials():
+    # a sequence planned as a single segment is finished in the decode kernel: its partial rows stay untouched and the
+    # combine kernel skips it; mixed with multi-segment sequences in the same launch, every row exact
+    d, g, hkv = 128, 4, 2
+    T.reserve("cuda", 8, g * hkv, head_dim=d, num_kv_heads=hkv)
+    buf = T._scratch[torch.cuda.current_device()]
+    tm = T._target(torch.cuda.current_device(), T._rule(d, True, False, 8)[3])
+    a = T._layout(8, g * hkv, d, tm)[1]
+    for lens in ([0, 1, 5, 100], [3, 40000, 7, 0, 20000, 2, 1, 9]):
+        buf.fill_(float("nan"))
+        q, k, v, bt, sl = G.batch(lens, g, d, hkv=hkv, seed=len(lens), cap=40960)
+        out = T.decode_attention(q, k, v, torch.empty_like(q), bt, sl, d ** -0.5)
+        G.assert_close(out, G.oracle(q, k, v, bt, sl, d ** -0.5))
+        if max(lens) < 128:  # every sequence one segment (MIN_SEG >= 128): no partial written at all
+            assert buf[:a].isnan().all()
 
 
 def test_graph_capture_after_reserve_compiles_nothing_and_matches_eager():
