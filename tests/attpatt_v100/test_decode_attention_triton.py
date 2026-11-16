@@ -75,6 +75,25 @@ def test_reserve_compiles_everything_later_batches_need(g, d):
     assert [compiled(f) for f in kernels] == before
 
 
+def test_batch_size_bucket_rules_compile_at_reserve_and_stay_exact(monkeypatch):
+    # the launch rule may differ per batch-size bucket (BATCH_EDGES); reserve() must compile every bucket's kernel
+    # shape the reserved rows reach, so no batch size compiles inside CUDA graph capture
+    rules = {}
+    for k, (bn, nw, ns, per_sm, min_seg) in T.RULES.items():
+        rules[k] = {0: (bn, nw, 1, 2, 128), 1: (bn, nw, ns, per_sm, min_seg), 2: (bn, nw, 2, 8, 512)}[k[3]]
+    monkeypatch.setattr(T, "RULES", rules)
+    d, g, hkv = 128, 8, 2
+    T.reserve("cuda", 64, g * hkv, head_dim=d, num_kv_heads=hkv)
+    kernels = (T._plan_kernel, T._decode_kernel, T._combine_kernel)
+    before = [compiled(f) for f in kernels]
+    for n in (1, 4, 5, 32, 33, 64):
+        lens = [(613 * i) % 9000 + 1 for i in range(n)]
+        q, k, v, bt, sl = G.batch(lens, g, d, hkv=hkv, seed=n)
+        G.assert_close(T.decode_attention(q, k, v, torch.empty_like(q), bt, sl, d ** -0.5),
+                       G.oracle(q, k, v, bt, sl, d ** -0.5))
+    assert [compiled(f) for f in kernels] == before
+
+
 def test_graph_capture_after_reserve_compiles_nothing_and_matches_eager():
     lens = [0, 1, 513, 4097, 32768]
     q, k, v, bt, sl = G.batch(lens, 7, 128, hkv=4, seed=8, cap=40960)

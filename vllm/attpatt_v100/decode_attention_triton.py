@@ -57,6 +57,11 @@ CONFIGS = {  # (head dim class, tensor cores, window) -> (BLOCK_N, num_warps, nu
     (512, False, False): (16, 4, 1), (512, False, True): (16, 4, 1),
     (512, True, False): (16, 4, 1), (512, True, True): (16, 4, 1),
 }
+# batch-size buckets of the launch rule: rows <= 4, <= 32, > 32 (one CUDA graph per batch size, so the row count is known
+# on the host when the graph is captured); RULES (head dim class, tensor cores, window, bucket) -> (BLOCK_N, num_warps,
+# num_stages, work items per SM, minimum segment)
+BATCH_EDGES = (4, 32)
+RULES = {k + (b,): v + (BLOCKS_PER_SM, MIN_SEG) for k, v in CONFIGS.items() for b in range(len(BATCH_EDGES) + 1)}
 
 # tuning hook (AttPatt tools/v100_triton/tdecode_tune2.py): dict with any of block_n / num_warps / num_stages / target / min_seg
 # overriding the rules below for every call; None in production
@@ -212,19 +217,25 @@ def _index(device):
     return d.index if d.index is not None else torch.cuda.current_device()
 
 
-def _target(i):
-    """work items one launch is spread over (per KV head): BLOCKS_PER_SM per multiprocessor"""
+def _target(i, per_sm=None):
+    """work items one launch is spread over (per KV head): per_sm per multiprocessor; None: the largest any rule uses
+    (sizes the scratch)"""
     if _TUNE and "target" in _TUNE:
         return _TUNE["target"]
     sms = _sms.get(i)
     if sms is None:
         sms = _sms[i] = torch.cuda.get_device_properties(i).multi_processor_count
-    return BLOCKS_PER_SM * sms
+    return (per_sm or max(r[3] for r in RULES.values())) * sms
 
 
-def _config(head_dim, use_dot, has_window):
+def _bucket(rows):
+    return next((j for j, e in enumerate(BATCH_EDGES) if rows <= e), len(BATCH_EDGES))
+
+
+def _rule(head_dim, use_dot, has_window, rows):
+    """(BLOCK_N, num_warps, num_stages, work items per SM, minimum segment) for a launch over `rows` sequences"""
     d = head_dim if head_dim in (256, 512) else 128
-    return CONFIGS[(d, use_dot, has_window)]
+    return RULES[(d, use_dot, has_window, _bucket(rows))]
 
 
 def _align(n):
@@ -282,11 +293,14 @@ def _warm(i, hq, hkv, d, page):
     q = torch.zeros(1, hq, d, dtype=torch.float16, device=dev)
     kv = torch.zeros(2, hkv, page, 2 * d, dtype=torch.float16, device=dev)
     k, v = kv[..., :d].transpose(1, 2), kv[..., d:].transpose(1, 2)
-    bt = torch.ones(1, 16, dtype=torch.int32, device=dev)
-    sl = torch.ones(1, dtype=torch.int32, device=dev)
-    for window in (0, 1):
-        for softcap in (0.0, 1.0):
-            decode_attention(q, k, v, torch.empty_like(q), bt, sl, 1.0, window=window, softcap=softcap)
+    # one row count per batch-size bucket the reserved rows reach (each bucket may launch another kernel shape)
+    for n in sorted({min(r, _rows[i]) for r in (1,) + tuple(e + 1 for e in BATCH_EDGES)}):
+        qn = q.expand(n, hq, d).contiguous()
+        bt = torch.ones(n, 16, dtype=torch.int32, device=dev)
+        sl = torch.ones(n, dtype=torch.int32, device=dev)
+        for window in (0, 1):
+            for softcap in (0.0, 1.0):
+                decode_attention(qn, k, v, torch.empty_like(qn), bt, sl, 1.0, window=window, softcap=softcap)
 
 
 def _reset_for_tests():
@@ -309,7 +323,7 @@ def decode_attention(q, k_cache, v_cache, out, block_table, seq_lens, scale, win
         return out
     G = nq // hkv
     i = q.device.index
-    target = _target(i)
+    target = _target(i)  # largest any rule uses: the row chunking below does not depend on the rule
     capturing = torch.cuda.is_current_stream_capturing()
     buf = _scratch.get(i)
     if capturing:
@@ -329,19 +343,19 @@ def decode_attention(q, k_cache, v_cache, out, block_table, seq_lens, scale, win
     gp = max(16, triton.next_power_of_2(G)) if use_dot else triton.next_power_of_2(G)
     dp = triton.next_power_of_2(d)
     has_window, has_softcap = bool(window), bool(softcap)
-    bn, nw, ns = _config(d, use_dot, has_window)
-    min_seg = MIN_SEG
-    if _TUNE:
-        bn, nw, ns = _TUNE.get("block_n", bn), _TUNE.get("num_warps", nw), _TUNE.get("num_stages", ns)
-        min_seg = _TUNE.get("min_seg", min_seg)
     for r0 in range(0, n, rows):
         m = min(rows, n - r0)
-        items = target + m
-        _, a, b_, c, e, _ = _layout(m, nq, d, target)
+        bn, nw, ns, per_sm, min_seg = _rule(d, use_dot, has_window, m)
+        if _TUNE:
+            bn, nw, ns = _TUNE.get("block_n", bn), _TUNE.get("num_warps", nw), _TUNE.get("num_stages", ns)
+            min_seg = _TUNE.get("min_seg", min_seg)
+        tm = _target(i, per_sm)
+        items = tm + m
+        _, a, b_, c, e, _ = _layout(m, nq, d, tm)
         pacc, pm, pl = buf[:a], buf[a:b_], buf[b_:c]
         cum, seg = buf[c:c + m].view(torch.int32), buf[e:e + 1].view(torch.int32)
         qq, oo, bt, sl = q[r0:r0 + m], out[r0:r0 + m], block_table[r0:r0 + m], seq_lens[r0:r0 + m]
-        _plan_kernel[(1,)](sl, cum, seg, m, int(window), target, MIN_LEN=min_seg, BLOCK_N=bn,
+        _plan_kernel[(1,)](sl, cum, seg, m, int(window), tm, MIN_LEN=min_seg, BLOCK_N=bn,
                            BP=max(16, triton.next_power_of_2(bound)), HAS_WINDOW=has_window, num_warps=4)
         _decode_kernel[(items, hkv)](
             qq, k_cache, v_cache, bt, sl, cum, seg, pm, pl, pacc,
