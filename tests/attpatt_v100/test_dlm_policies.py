@@ -183,7 +183,7 @@ def _count_schedule(policy_cls, gen, steps, family, **cfg):
             )
         )
         counts.append(int(decision.revealed.sum()))
-        canvas = decision.canvas
+        canvas = torch.where(decision.revealed, 3, canvas)
     return counts
 
 

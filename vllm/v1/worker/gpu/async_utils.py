@@ -148,6 +148,9 @@ class AsyncOutput(AsyncModelRunnerOutput):
             if sampler_output.num_nans is not None:
                 self.num_nans = async_copy_to_np(sampler_output.num_nans)
             self.num_sampled_tokens_np = async_copy_to_np(num_sampled_tokens)
+            self.dlm_trace = None
+            if sampler_output.dlm_trace is not None:
+                self.dlm_trace = sampler_output.dlm_trace.to_cpu_nonblocking()
             self.sampling_mask_tensors: SamplingMaskTensors | None = None
             if sampler_output.sampling_mask_tensors is not None:
                 self.sampling_mask_tensors = (
@@ -198,6 +201,8 @@ class AsyncOutput(AsyncModelRunnerOutput):
 
         if self.logprobs_tensors is not None:
             self.model_runner_output.logprobs = self.logprobs_tensors.tolists()
+        if self.dlm_trace is not None:
+            self.model_runner_output.dlm_trace = self.dlm_trace.split()
         self.model_runner_output.prompt_logprobs_dict = self.prompt_logprobs_dict
         self.model_runner_output.prompt_token_id_logprobs_dict = (
             self.prompt_token_id_logprobs_dict

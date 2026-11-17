@@ -516,6 +516,10 @@ class FullSequenceDiffusionConfig(VerifyAndUpdateConfig):
             unsupported.append("speculative decoding")
         if vllm_config.lora_config is not None:
             unsupported.append("LoRA")
+        if vllm_config.model_config.logprobs_mode.startswith("processed"):
+            # Logprobs come from the raw model distribution of the step that
+            # wrote each token; there is no processed distribution.
+            unsupported.append("logprobs_mode processed_*")
         if unsupported:
             raise ValueError(f"{name} does not support: {', '.join(unsupported)}")
         if not vllm_config.use_v2_model_runner:

@@ -246,6 +246,10 @@ class EngineCoreOutput(
     # Sent with FinishReason.ERROR, e.g. when a paused engine rejects a request.
     error: RequestError | None = None
 
+    # Full-sequence diffusion trajectory, name -> [steps, G, ...]; final output
+    # only. Appended last for array_like compatibility.
+    dlm_trace: dict[str, np.ndarray] | None = None
+
     @property
     def finished(self) -> bool:
         return self.finish_reason is not None

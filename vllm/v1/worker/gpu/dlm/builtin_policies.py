@@ -112,6 +112,11 @@ class LLaDAPolicy(UnmaskPolicy):
         greedy = [c.temperature == 0.0 for c in cfgs]
 
         eos_inf = [c.policy_args["logits_eos_inf"] for c in cfgs]
+        conf_eos = [c.policy_args["confidence_eos_eot_inf"] for c in cfgs]
+        if any(eos_inf) or any(conf_eos):
+            # The official code edits logits in place; the engine still
+            # needs the raw ones (logprobs, trajectory).
+            logits = logits.clone()
         if any(eos_inf):
             # generate.py:173-174
             rows = _to_device(_row_flags(x, eos_inf), logits)
@@ -138,7 +143,6 @@ class LLaDAPolicy(UnmaskPolicy):
             row_greedy = _to_device(_row_flags(x, greedy), logits)
             x0 = torch.where(row_greedy, x0, noisy)
 
-        conf_eos = [c.policy_args["confidence_eos_eot_inf"] for c in cfgs]
         if any(conf_eos):
             # generate.py:178: `logits_with_noise[:, :, 126081] =
             # logits[:, :, 126348] = -inf`, after x0. With T == 0,
@@ -190,9 +194,7 @@ class LLaDAPolicy(UnmaskPolicy):
         # -inf elsewhere; reveal the top k.
         confidence = torch.where(candidates, x.confidence, float("-inf"))
         reveal = topk_mask(confidence, k) & candidates
-        return DlmStepDecision(
-            canvas=torch.where(reveal, x.x0, x.canvas), revealed=reveal
-        )
+        return DlmStepDecision(revealed=reveal)
 
 
 @register_unmask_policy
@@ -360,9 +362,7 @@ class DreamPolicy(UnmaskPolicy):
                 )
                 confidence = torch.where(use & candidates, keyed, confidence)
             reveal = topk_mask(confidence, k) & candidates
-        return DlmStepDecision(
-            canvas=torch.where(reveal, x.x0, x.canvas), revealed=reveal
-        )
+        return DlmStepDecision(revealed=reveal)
 
 
 def _top_p_logits(logits: torch.Tensor, top_p: torch.Tensor) -> torch.Tensor:

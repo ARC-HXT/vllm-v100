@@ -207,6 +207,8 @@ class Request:
         self.dlm_total_steps = 0
         self.dlm_steps_scheduled = 0
         self.dlm_steps_done = 0
+        # DlmTraceAccumulator of a request that asked for its trajectory.
+        self.dlm_trace: Any = None
 
         # Block-aligned token position of a proven shared prefix worth pinning
         # in the (sparse) prefix cache; 0 means none. Set at admission for

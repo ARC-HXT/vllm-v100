@@ -149,6 +149,12 @@ def normalize_full_sequence_diffusion_params(
         DlmRequestConfig,
         get_unmask_policy_cls,
     )
+    from vllm.v1.worker.gpu.dlm.trace import (
+        DEFAULT_TRACE_TOPK,
+        MAX_TRACE_TOPK,
+        TRACE_KEY,
+        TRACE_TOPK_KEY,
+    )
 
     gen_length = params.max_tokens
     _check(
@@ -159,7 +165,8 @@ def normalize_full_sequence_diffusion_params(
     unsupported = {
         "stop": params.stop,
         "stop_token_ids": params.stop_token_ids,
-        "logprobs": params.logprobs is not None,
+        # Full-vocabulary sample logprobs (-1) would stash [G, V] per request.
+        "logprobs=-1": params.logprobs == -1,
         "prompt_logprobs": params.prompt_logprobs is not None,
         "min_tokens": params.min_tokens,
         "min_p": params.min_p,
@@ -206,9 +213,23 @@ def normalize_full_sequence_diffusion_params(
     )
 
     extra = dict(params.extra_args or {})
-    known = {POLICY_KEY, POLICY_ARGS_KEY, STEPS_KEY, BLOCK_KEY}
+    known = {POLICY_KEY, POLICY_ARGS_KEY, STEPS_KEY, BLOCK_KEY, TRACE_KEY}
+    known.add(TRACE_TOPK_KEY)
     stray = sorted(k for k in extra if k.startswith("diffusion_") and k not in known)
     _check(not stray, f"unsupported diffusion options: {stray}")
+    trace = extra.get(TRACE_KEY, False)
+    _check(isinstance(trace, bool), f"{TRACE_KEY} must be a boolean.")
+    trace_topk = extra.get(TRACE_TOPK_KEY, DEFAULT_TRACE_TOPK)
+    _check(
+        isinstance(trace_topk, int)
+        and not isinstance(trace_topk, bool)
+        and 0 <= trace_topk <= MAX_TRACE_TOPK,
+        f"{TRACE_TOPK_KEY} must be an integer in [0, {MAX_TRACE_TOPK}].",
+    )
+    _check(
+        trace or TRACE_TOPK_KEY not in extra,
+        f"{TRACE_TOPK_KEY} needs {TRACE_KEY}=True.",
+    )
 
     if family == "llada":
         default_policy = "llada_low_confidence"
@@ -271,6 +292,9 @@ def normalize_full_sequence_diffusion_params(
             POLICY_ARGS_KEY: policy_args,
         }
     )
+    if trace:
+        extra[TRACE_KEY] = True
+        extra[TRACE_TOPK_KEY] = trace_topk
     params.extra_args = extra
     # Official decoding returns the whole canvas (generate.py:262 decodes it
     # with skip_special_tokens), so EOS never ends a request early.

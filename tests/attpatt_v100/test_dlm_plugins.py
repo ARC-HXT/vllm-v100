@@ -47,9 +47,7 @@ class LeftToRight(UnmaskPolicy):
         reveal = x.is_masked & (rank <= per_step)
         last = (x.step == x.num_steps - 1)[:, None]
         reveal = reveal | (x.is_masked & last)
-        return DlmStepDecision(
-            canvas=torch.where(reveal, x.x0, x.canvas), revealed=reveal
-        )
+        return DlmStepDecision(revealed=reveal)
 
 
 class WithArgs(LeftToRight):

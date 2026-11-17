@@ -7,8 +7,13 @@ A step works in two stages (plan 2.8 high #4):
 1. ``score``: per canvas position, over row chunks of ``[N, V]`` fp32 logits.
    The policy returns per-row tensors (at least ``x0`` and ``confidence``).
 2. ``select``: per request, over small ``[R, W]`` tensors. The policy returns
-   the new canvas (reveal = mask -> token, remask = token -> mask, rewrite =
-   token -> other token).
+   which positions to reveal (mask -> x0), remask (token -> mask) and
+   rewrite (token -> x0); the engine writes the new canvas. A revealed or
+   rewritten position always takes the ``x0`` that ``score`` returned for it,
+   so the engine can report that token's log-probability.
+
+``score`` must not modify ``x.logits`` in place: the engine reads the same
+logits for logprobs and the trajectory.
 
 Policies must not synchronize with the host (no ``.item()``, ``.cpu()``,
 ``nonzero()``, boolean indexing) and, under tensor parallelism, must draw
@@ -24,6 +29,8 @@ from typing import Any, ClassVar
 
 import numpy as np
 import torch
+
+from vllm.v1.worker.gpu.dlm.trace import TRACE_KEY, TRACE_TOPK_KEY
 
 # Keys a client sets in SamplingParams.extra_args (normalized at admission by
 # vllm.utils.diffusion.normalize_full_sequence_diffusion_params).
@@ -46,6 +53,8 @@ class DlmRequestConfig:
     top_p: float = 1.0
     top_k: int = 0  # 0 = off
     prompt_len: int = 0  # P (worker side)
+    trace_topk: int = -1  # per-step trajectory top-k; -1 = no trajectory
+    num_logprobs: int = -1  # SamplingParams.logprobs; -1 = none
 
     @property
     def num_blocks(self) -> int:
@@ -67,6 +76,8 @@ class DlmRequestConfig:
         if POLICY_KEY not in extra or STEPS_KEY not in extra:
             return None
         return cls(
+            trace_topk=extra[TRACE_TOPK_KEY] if extra.get(TRACE_KEY) else -1,
+            num_logprobs=-1 if params.logprobs is None else params.logprobs,
             gen_length=params.max_tokens,
             steps=extra[STEPS_KEY],
             block_length=extra.get(BLOCK_KEY) or params.max_tokens,
@@ -124,10 +135,9 @@ class DlmSelectInputs:
 
 @dataclass
 class DlmStepDecision:
-    canvas: torch.Tensor  # [R, W] int64, the new canvas
-    revealed: torch.Tensor  # [R, W] bool, mask -> token
+    revealed: torch.Tensor  # [R, W] bool, mask -> x0
     remasked: torch.Tensor | None = None  # [R, W] bool, token -> mask
-    rewritten: torch.Tensor | None = None  # [R, W] bool, token -> token
+    rewritten: torch.Tensor | None = None  # [R, W] bool, token -> x0
 
 
 class UnmaskPolicy(ABC):

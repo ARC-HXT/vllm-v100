@@ -1857,6 +1857,7 @@ class Scheduler(SchedulerInterface):
             # so the in-flight steps' outputs belong to the old run.
             request.dlm_steps_scheduled = 0
             request.dlm_steps_done = 0
+            request.dlm_trace = None
             request.drop_stale_output = True
         request.num_preemptions += 1
         if self.log_stats:
@@ -2427,6 +2428,15 @@ class Scheduler(SchedulerInterface):
 
             stopped = False
             if request.dlm_total_steps and not output_is_stale:
+                dlm_trace = model_runner_output.dlm_trace
+                if dlm_trace is not None and req_id in dlm_trace:
+                    if request.dlm_trace is None:
+                        from vllm.v1.worker.gpu.dlm.trace import (
+                            DlmTraceAccumulator,
+                        )
+
+                        request.dlm_trace = DlmTraceAccumulator(request.dlm_total_steps)
+                    request.dlm_trace.add(request.dlm_steps_done, dlm_trace[req_id])
                 request.dlm_steps_done += 1
                 if (
                     request.dlm_steps_done >= request.dlm_total_steps
@@ -2583,6 +2593,12 @@ class Scheduler(SchedulerInterface):
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        dlm_trace=(
+                            request.dlm_trace.result()
+                            if finish_reason is not None
+                            and request.dlm_trace is not None
+                            else None
+                        ),
                     )
                 )
             else:

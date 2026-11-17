@@ -4,13 +4,16 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors, SamplingMaskLists
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.dlm.trace import DlmTraceTensors
 
 
 @dataclass
@@ -21,6 +24,8 @@ class SamplerOutput:
     num_sampled: torch.Tensor
     num_rejected: torch.Tensor
     sampling_mask_tensors: SamplingMaskTensors | None = None
+    # Full-sequence diffusion trajectory rows of this step (dlm/trace.py).
+    dlm_trace: DlmTraceTensors | None = None
 
 
 @triton.jit
