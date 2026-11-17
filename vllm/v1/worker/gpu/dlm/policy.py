@@ -135,6 +135,9 @@ class UnmaskPolicy(ABC):
     tensors indexed by slot, written in ``init_request``."""
 
     name: ClassVar[str]
+    # Model families (ModelConfig.full_sequence_diffusion) it supports; None
+    # = any.
+    families: ClassVar[tuple[str, ...] | None] = None
     # Pass the final-norm hidden states of the canvas rows to ``score``.
     needs_hidden_states: ClassVar[bool] = False
     # Peak transient bytes per logit element in ``score`` (sizes row chunks).
@@ -169,37 +172,82 @@ class UnmaskPolicy(ABC):
         raise NotImplementedError
 
 
+# --------------------------------------------------------------------------
+# Registry. Same shape as ReasoningParserManager (eager + lazy registration);
+# classes are loaded with the logits-processor FQCN loader. A policy can be
+# named in a request by:
+#   * a registered name (built-ins, or ``register_unmask_policy`` called from
+#     a ``vllm.general_plugins`` entry point, which every process loads);
+#   * an entry point of group ``vllm.diffusion_policies`` (name -> FQCN);
+#   * a fully-qualified class name ``<module>:<class>``.
+# Lookup failures raise; the frontend rejects such requests at admission.
+# --------------------------------------------------------------------------
+
+DIFFUSION_POLICIES_GROUP = "vllm.diffusion_policies"
+
 _POLICIES: dict[str, type[UnmaskPolicy]] = {}
+_LAZY_POLICIES: dict[str, str] = {}  # name -> "<module>:<class>"
+_entry_points_loaded = False
 
 
 def register_unmask_policy(
-    cls: type[UnmaskPolicy] | None = None, *, force: bool = False
+    cls: type[UnmaskPolicy] | None = None,
+    *,
+    name: str | None = None,
+    force: bool = False,
 ) -> Callable | type[UnmaskPolicy]:
-    """Register a policy class under ``cls.name`` (usable as a decorator)."""
+    """Register a policy class under ``name`` (default ``cls.name``); usable
+    as a decorator."""
 
     def _register(policy_cls: type[UnmaskPolicy]) -> type[UnmaskPolicy]:
         if not (isinstance(policy_cls, type) and issubclass(policy_cls, UnmaskPolicy)):
             raise TypeError(f"{policy_cls!r} is not an UnmaskPolicy subclass")
-        name = policy_cls.name
-        if not force and name in _POLICIES and _POLICIES[name] is not policy_cls:
-            raise KeyError(f"diffusion policy {name!r} is already registered")
-        _POLICIES[name] = policy_cls
+        key = name or policy_cls.name
+        if not force and key in _POLICIES and _POLICIES[key] is not policy_cls:
+            raise KeyError(f"diffusion policy {key!r} is already registered")
+        _POLICIES[key] = policy_cls
         return policy_cls
 
     return _register if cls is None else _register(cls)
 
 
+def register_lazy_unmask_policy(name: str, fqcn: str) -> None:
+    """Register ``name`` -> ``<module>:<class>``; imported on first use."""
+    _LAZY_POLICIES[name] = fqcn
+
+
+def list_unmask_policies() -> list[str]:
+    _ensure_registered()
+    return sorted(set(_POLICIES) | set(_LAZY_POLICIES))
+
+
 def get_unmask_policy_cls(name: str) -> type[UnmaskPolicy]:
-    _ensure_builtins()
-    if name not in _POLICIES:
+    _ensure_registered()
+    if name in _POLICIES:
+        return _POLICIES[name]
+    fqcn = _LAZY_POLICIES.get(name) or (name if ":" in name else None)
+    if fqcn is None:
         raise ValueError(
-            f"Unknown diffusion policy {name!r}; registered: {sorted(_POLICIES)}"
+            f"Unknown diffusion policy {name!r}; registered: {list_unmask_policies()}"
         )
-    return _POLICIES[name]
+    from vllm.utils.import_utils import load_class_by_fqcn
+
+    policy_cls = load_class_by_fqcn(fqcn, UnmaskPolicy, "diffusion policy")
+    _POLICIES[name] = policy_cls
+    return policy_cls
 
 
-def _ensure_builtins() -> None:
+def _ensure_registered() -> None:
+    global _entry_points_loaded
     from vllm.v1.worker.gpu.dlm import builtin_policies  # noqa: F401
+
+    if _entry_points_loaded:
+        return
+    _entry_points_loaded = True
+    from importlib.metadata import entry_points
+
+    for ep in entry_points(group=DIFFUSION_POLICIES_GROUP):
+        _LAZY_POLICIES.setdefault(ep.name, ep.value)
 
 
 # --------------------------------------------------------------------------

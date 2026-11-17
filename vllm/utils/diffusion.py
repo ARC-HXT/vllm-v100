@@ -140,6 +140,7 @@ def normalize_full_sequence_diffusion_params(
     official ones: LLaDA generate() signature (generate.py:96-99), Dream
     generation_config.json.
     """
+    from vllm.v1.worker.gpu.dlm.builtin_policies import DreamPolicy
     from vllm.v1.worker.gpu.dlm.policy import (
         BLOCK_KEY,
         POLICY_ARGS_KEY,
@@ -236,7 +237,7 @@ def normalize_full_sequence_diffusion_params(
 
     try:
         policy_cls = get_unmask_policy_cls(policy_name)
-    except ValueError as e:
+    except Exception as e:  # unknown name, or a plugin that fails to load
         raise VLLMValidationError(str(e), parameter="extra_args") from e
     families = getattr(policy_cls, "families", None)
     _check(
@@ -244,7 +245,7 @@ def normalize_full_sequence_diffusion_params(
         f"diffusion policy {policy_name!r} is for {families}, not {family}.",
     )
     policy_args = dict(extra.get(POLICY_ARGS_KEY) or {})
-    if family == "dream":
+    if issubclass(policy_cls, DreamPolicy):
         policy_args.setdefault("eps", generation_config.get("eps", 1e-3))
         policy_args.setdefault("alg_temp", generation_config.get("alg_temp"))
     config = DlmRequestConfig(

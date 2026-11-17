@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import importlib
 import inspect
 import itertools
 from abc import abstractmethod
@@ -14,6 +13,7 @@ from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.logits_process import LogitsProcessor as RequestLogitsProcessor
 from vllm.sampling_params import SamplingParams
+from vllm.utils.import_utils import load_class_by_fqcn
 from vllm.utils.torch_utils import guard_cuda_initialization
 from vllm.v1.sample.logits_processor.builtin import (
     LogitBiasLogitsProcessor,
@@ -114,7 +114,7 @@ def _load_logitsprocs_by_fqcns(
     )
 
     classes: list[type[LogitsProcessor]] = []
-    for ldx, logitproc in enumerate(logits_processors):
+    for logitproc in logits_processors:
         if isinstance(logitproc, type):
             logger.debug(" - Already-loaded logit processor: %s", logitproc.__name__)
             if not issubclass(logitproc, LogitsProcessor):
@@ -125,38 +125,9 @@ def _load_logitsprocs_by_fqcns(
             continue
 
         logger.debug("- Loading logits processor %s", logitproc)
-        parts = logitproc.split(":")
-        if len(parts) != 2:
-            raise ValueError(
-                f"Invalid logits processor FQCN {logitproc!r}. "
-                "Expected format: '<module>:<type>'"
-            )
-        module_path, qualname = parts
-
-        try:
-            # Load module
-            with guard_cuda_initialization():
-                module = importlib.import_module(module_path)
-        except Exception as e:
-            logger.error(
-                "Failed to load %sth LogitsProcessor plugin %s: %s",
-                ldx,
-                logitproc,
-                e,
-            )
-            raise RuntimeError(
-                f"Failed to load {ldx}th LogitsProcessor plugin {logitproc}"
-            ) from e
-
-        # Walk down dotted name to get logitproc class
-        obj = module
-        for attr in qualname.split("."):
-            obj = getattr(obj, attr)
-        if not isinstance(obj, type):
-            raise ValueError("Loaded logit processor must be a type.")
-        if not issubclass(obj, LogitsProcessor):
-            raise ValueError(f"{obj.__name__} must be a subclass of LogitsProcessor")
-        classes.append(obj)
+        classes.append(
+            load_class_by_fqcn(logitproc, LogitsProcessor, "logits processor")
+        )
 
     return classes
 

@@ -67,6 +67,7 @@ class FullSeqDiffusionSampler:
         # P + 2G <= max_model_len (checked at admission), so G < max_len / 2.
         self.max_canvas = max(1, model_state.max_model_len // 2)
         self.configs: list[DlmRequestConfig | None] = [None] * self.max_num_reqs
+        self.failed = [False] * self.max_num_reqs
         self.policies: dict[str, UnmaskPolicy] = {}
         self.policy_states: dict[str, dict[str, torch.Tensor]] = {}
 
@@ -88,12 +89,23 @@ class FullSeqDiffusionSampler:
         self.sampling_states.add_request(req_idx, sampling_params)
         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
         config = DlmRequestConfig.from_sampling_params(sampling_params)
+        self.failed[req_idx] = False
         if config is not None:
             config.prompt_len = (
                 int(self.req_states.prompt_len.np[req_idx]) - config.gen_length
             )
-            policy = self._policy(config.policy)
-            policy.init_request(req_idx, config, self.policy_states[config.policy])
+            try:
+                policy = self._policy(config.policy)
+                policy.init_request(req_idx, config, self.policy_states[config.policy])
+            except Exception:
+                # E.g. a plugin policy the frontend found but this worker
+                # cannot load. The request is never stepped and returns no
+                # tokens on its last step, which the scheduler finishes as an
+                # error; the engine keeps running.
+                logger.exception(
+                    "Diffusion policy %r failed on this worker", config.policy
+                )
+                self.failed[req_idx] = True
         self.configs[req_idx] = config
 
     def apply_staged_writes(self) -> None:
@@ -122,8 +134,9 @@ class FullSeqDiffusionSampler:
         for batch_idx in range(num_reqs):
             slot = int(input_batch.idx_mapping_np[batch_idx])
             config = self.configs[slot]
-            if config is None:
-                # Not a diffusion request (the runner's kernel warmup).
+            if config is None or self.failed[slot]:
+                # Not a diffusion request (the runner's kernel warmup), or one
+                # whose policy failed to load (add_request).
                 continue
             req_id = input_batch.req_ids[batch_idx]
             step = steps.get(req_id)
