@@ -385,7 +385,8 @@ def prepare(dev):
     for (M, N, K, bias), r in recs.items():
         if r is not None and r.get("tri") is not None:
             cfg = tuple(int(v) for v in r["tri"])
-            tri.warmup(M, N, K, cfg, bias)  # compiled here, never under graph capture
+            with torch.cuda.device(i):  # Triton compiles for the current device
+                tri.warmup(M, N, K, cfg, bias)  # compiled here, never under graph capture
             _table[(i, M, N, K, bias)] = cfg
             need32 = max(need32, tri.workspace_elems(M, N, cfg))
             n_tri += 1

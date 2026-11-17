@@ -71,12 +71,23 @@ def test_bias_error_not_worse_than_f_linear(m, scale):
             assert G.rms(new) <= G.rms(old) * G.RMS_TOL, (m, scale, seed)
 
 
-def test_bias_reaches_cublaslt(monkeypatch):
-    m = next(mm for mm in MS if G.entry(0, mm, QKV[1], QKV[0], True) is not None)
+def _entries(kind):
+    """M values whose table entry is a cuBLASLt row (kind 'lt') or a Triton configuration (kind 'tri'); which kind wins
+    an M is decided by timing at selection, so the tests below take whatever M has the kind they check"""
+    return [mm for mm in MS if (e := G.entry(0, mm, QKV[1], QKV[0], True)) is not None
+            and isinstance(e, tuple) == (kind == "tri")]
+
+
+@pytest.mark.parametrize("kind,module", [("lt", "lt"), ("tri", "tri")])
+def test_bias_reaches_the_selected_kernel(monkeypatch, kind, module):
+    ms = _entries(kind)
+    if not ms:
+        pytest.skip(f"no {kind} entry was selected for the bias shape on this GPU")
     seen = []
-    real = G.lt.matmul
-    monkeypatch.setattr(G.lt, "matmul", lambda *a: (seen.append(a[-1] is not None), real(*a))[1])
-    x, w, b = data(m, 93)
+    real = getattr(G, module).matmul
+    monkeypatch.setattr(getattr(G, module), "matmul",
+                        lambda *a: (seen.append(a[-1] is not None), real(*a))[1])
+    x, w, b = data(ms[0], 93)
     G.linear(None, x, w, b)
     assert seen == [True]
 
