@@ -92,8 +92,18 @@ def llm():
         max_model_len=2048 if MODEL == "llada" else 4096,
         max_num_seqs=8,
         gpu_memory_utilization=0.85,
+        # A/B of engine settings, e.g. '{"inductor_compile_config": {...}}'.
+        compilation_config=json.loads(os.environ.get("DLM_COMPILATION_CONFIG", "{}"))
+        or None,
     )
-    report({"test": "load", "model": MODEL, "sec": round(time.time() - t0, 1)})
+    report(
+        {
+            "test": "load",
+            "model": MODEL,
+            "sec": round(time.time() - t0, 1),
+            "compilation_config": os.environ.get("DLM_COMPILATION_CONFIG"),
+        }
+    )
     yield engine
     del engine
     gc.collect()
@@ -369,3 +379,48 @@ def test_seeded_sampling_is_reproducible(llm):
             "other_seed_differs": list(runs[0]) != list(runs[2])})  # fmt: skip
     assert list(runs[0]) == list(runs[1])
     assert list(runs[0]) != list(runs[2])
+
+
+# --------------------------------------------------------------------------
+# 5. Custom policy plugin loaded by class name in the worker process.
+# --------------------------------------------------------------------------
+
+EDIT = "tests.attpatt_v100.test_dlm_custom_policies:FeatureEditPolicy"
+
+
+def test_custom_policy_in_the_worker(llm):
+    """The test policy of test_dlm_custom_policies (reveal, remask, rewrite,
+    hidden-state features) runs in the engine's worker; every operation
+    shows up in the trajectory; a batch mixing it with the built-in policy
+    gives the single-run results."""
+    refs = [load_ref(REF_SETS[MODEL][0], i) for i in range(2)]
+    meta = refs[0]["meta"]
+    prompts = [r["prompt_ids"] for r in refs]
+    edit = sampling(
+        meta,
+        diffusion_policy=EDIT,
+        diffusion_block_length=ref_gen_len(meta),
+        diffusion_policy_args={"rewrite_gain": 0.5, "remask_logp": -3.0,
+                               "feature_weight": 0.01},
+        diffusion_trace=True,
+        diffusion_trace_topk=1,
+    )  # fmt: skip
+    builtin = sampling(meta)
+    single = [
+        generate(llm, [prompts[0]], edit)[0].outputs[0],
+        generate(llm, [prompts[1]], builtin)[0].outputs[0],
+    ]
+    mixed = [o.outputs[0] for o in generate(llm, prompts, [edit, builtin])]
+    flags = single[0].dlm_trace["flags"]
+    counts = {
+        "reveal": int(((flags & 1) > 0).sum()),
+        "remask": int(((flags & 2) > 0).sum()),
+        "rewrite": int(((flags & 4) > 0).sum()),
+    }
+    final_masks = int((np.array(single[0].token_ids) == MASK[MODEL]).sum())
+    same = [list(a.token_ids) == list(b.token_ids) for a, b in zip(single, mixed)]
+    report({"test": "custom_policy", "counts": counts,
+            "final_masks": final_masks, "mixed_equals_single": same})  # fmt: skip
+    assert counts["remask"] > 0 and counts["rewrite"] > 0
+    assert final_masks == 0
+    assert all(same)

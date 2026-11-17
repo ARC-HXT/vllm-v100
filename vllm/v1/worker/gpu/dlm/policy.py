@@ -98,6 +98,7 @@ class DlmScoreInputs:
     row_req: torch.Tensor  # [N] int64, request index within the group
     row_pos: torch.Tensor  # [N] int64, canvas position j
     row_slot: torch.Tensor  # [N] int64, request state slot
+    row_token: torch.Tensor  # [N] int64, current canvas token (mask_id if masked)
     row_req_np: np.ndarray  # CPU copy of row_req
     step: torch.Tensor  # [R] int64, global step index
     slots: torch.Tensor  # [R] int64

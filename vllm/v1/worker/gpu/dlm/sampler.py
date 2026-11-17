@@ -410,6 +410,8 @@ class FullSeqDiffusionSampler:
             hidden = hidden_states[hidden_rows_t[rows]]
             logits = compute_logits(hidden)
             chunk_req = row_req_t[rows]
+            flat = chunk_req * width + row_pos_t[rows]
+            current = canvas.view(-1)[flat]
             out = policy.score(
                 DlmScoreInputs(
                     logits=logits,
@@ -417,6 +419,7 @@ class FullSeqDiffusionSampler:
                     row_req=chunk_req,
                     row_pos=row_pos_t[rows],
                     row_slot=slots_t[chunk_req],
+                    row_token=current,
                     row_req_np=row_req[rows],
                     step=steps_t,
                     slots=slots_t,
@@ -428,7 +431,6 @@ class FullSeqDiffusionSampler:
                     mask_id=self.mask_id,
                 )
             )
-            flat = chunk_req * width + row_pos_t[rows]
             chunk_x0 = out.pop("x0").to(torch.int64)
             x0.view(-1).index_copy_(0, flat, chunk_x0)
             confidence.view(-1).index_copy_(
@@ -450,7 +452,6 @@ class FullSeqDiffusionSampler:
                 keep("lp_logp", flat, scores.logprobs)
                 keep("lp_rank", flat, scores.selected_token_ranks.to(torch.int32))
             if trace_topk >= 0:
-                current = canvas.view(-1)[flat]
                 tokens = torch.where(current == self.mask_id, chunk_x0, current)
                 for key, value in trace_row_stats(logits, tokens, trace_topk).items():
                     keep(key, flat, value.to(TRACE_FIELDS[key]))
