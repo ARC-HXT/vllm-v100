@@ -172,6 +172,42 @@ def test_dream_config_hook():
     )
 
 
+HEAD_DTYPE_MODELS = {
+    "llada": "/mnt/6t-disk/models/dlm/GSAI-ML/LLaDA-8B-Instruct",
+    "dream": "/mnt/6t-disk/models/dlm/Dream-org/Dream-v0-Instruct-7B",
+    "qwen3": "/mnt/6t-disk/models/llm/Qwen/Qwen3-4B",
+}
+
+
+@pytest.mark.parametrize(
+    "name, overrides, expected",
+    [
+        ("llada", None, "float32"),
+        ("dream", None, "float32"),
+        ("llada", {"head_dtype": "model"}, "float16"),
+        ("dream", {"head_dtype": "float16"}, "float16"),
+        ("qwen3", None, "float16"),  # autoregressive models keep the model dtype
+    ],
+)
+def test_resolved_head_dtype(name, overrides, expected):
+    # The engine's ModelConfig (config hook included) resolves the lm_head
+    # dtype without any caller override: fp32 logits for full-sequence
+    # diffusion, the user's explicit value wins, AR models are unaffected.
+    path = HEAD_DTYPE_MODELS[name]
+    if not Path(path, "config.json").exists():
+        pytest.skip(f"{path} not present")
+    from vllm.config import ModelConfig
+
+    mc = ModelConfig(
+        model=path,
+        trust_remote_code=True,
+        dtype="float16",
+        hf_overrides=overrides or {},
+    )
+    assert mc.is_full_sequence_diffusion == (name != "qwen3")
+    assert mc.head_dtype == getattr(torch, expected)
+
+
 def test_llada_weight_names_map_onto_llama_exactly():
     from vllm.model_executor.models.llada import LLADA_TO_LLAMA
 

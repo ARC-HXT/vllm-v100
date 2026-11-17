@@ -351,33 +351,38 @@ def test_batch_matches_single_runs(llm):
         params[1] = sampling(meta, diffusion_max_steps=64)
         params[1].max_tokens = 256
         params[2] = sampling(meta, diffusion_policy="dream_entropy")
-    single = [
-        generate(llm, [p], q)[0].outputs[0].token_ids for p, q in zip(prompts, params)
+    t0 = time.time()
+    single = [generate(llm, [prompts[0]], params[0])[0].outputs[0].token_ids]
+    sec_single0 = time.time() - t0
+    single += [
+        generate(llm, [p], q)[0].outputs[0].token_ids
+        for p, q in zip(prompts[1:], params[1:])
     ]
     together = [o.outputs[0].token_ids for o in generate(llm, prompts, params)]
 
-    # A request joining while others are mid-run.
+    # A request joining while another is mid-run. The engine core runs in its
+    # own process and emits a request's output only when it finishes, so
+    # engine.step() blocks until then: j3 is added after a third of j0's
+    # single-run time, and j0 must finish after that (it was still running).
     engine = llm.llm_engine
     from vllm.inputs import TokensPrompt
 
+    t0 = time.time()
     engine.add_request(
         "j0", TokensPrompt(prompt_token_ids=list(map(int, prompts[0]))), params[0]
     )
+    time.sleep(sec_single0 / 3)
+    engine.add_request(
+        "j3", TokensPrompt(prompt_token_ids=list(map(int, prompts[3]))), params[3]
+    )
+    t_join = time.time() - t0
     late: dict[str, list[int]] = {}
-    seen: list[tuple[str, bool]] = []
-    steps_run = 0
-    while len(late) < 2 and steps_run < 5000:
+    t_done: dict[str, float] = {}
+    while len(late) < 2 and engine.has_unfinished_requests():
         for out in engine.step():
-            seen.append((out.request_id, out.finished))
             if out.finished:
                 late[out.request_id] = out.outputs[0].token_ids
-        steps_run += 1
-        if steps_run == 5:
-            engine.add_request(
-                "j3",
-                TokensPrompt(prompt_token_ids=list(map(int, prompts[3]))),
-                params[3],
-            )
+                t_done[out.request_id] = time.time() - t0
     same_batch = [list(s) == list(t) for s, t in zip(single, together)]
     same_late = [
         list(late.get(r, [])) == list(single[i]) for r, i in (("j0", 0), ("j3", 3))
@@ -387,11 +392,13 @@ def test_batch_matches_single_runs(llm):
             "test": "batch",
             "same_batched": same_batch,
             "same_mid_join": same_late,
-            "engine_steps": steps_run,
-            "outputs_seen": seen[-6:],
+            "sec_single_j0": round(sec_single0, 2),
+            "sec_join": round(t_join, 2),
+            "sec_done": {k: round(v, 2) for k, v in t_done.items()},
         }
     )
     assert all(same_batch) and all(same_late)  # fmt: skip
+    assert t_done["j0"] > t_join  # j3 really joined while j0 was running
 
 
 def test_seeded_sampling_is_reproducible(llm):
