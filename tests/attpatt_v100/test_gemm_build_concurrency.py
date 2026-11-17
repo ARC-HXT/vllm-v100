@@ -25,7 +25,7 @@ G._cache_file = lambda dev, cache_dir, policy=None: cache_dir + ("/records.json"
 def stub(dev, M, N, K, bias=False):
     calls.append(M)
     time.sleep(0.25)
-    return dict(M=M, N=N, K=K, row=[M] * 16)
+    return dict(M=M, N=N, K=K, row=[M] * 16, tri_checked=True)
 G._select = stub
 time.sleep(max(0.0, start - time.time()))  # both processes start selecting together
 G.build("cuda:0", shapes=[(k, n)], ms=ms, cache_dir=cache)

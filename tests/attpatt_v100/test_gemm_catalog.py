@@ -27,6 +27,13 @@ def test_only_accepted_records_add_shapes_and_write_atomically(tmp_path):
     assert not list(tmp_path.glob("*.tmp"))
 
 
+def test_shape_accepted_only_through_a_triton_entry_is_listed(tmp_path):
+    """a shape whose only accepted entry is a Triton configuration (gemm_triton) still reaches ON_SHAPES; otherwise the
+    engine never routes it to the table (found by test_gemm_triton on V100, 2026-11-18)"""
+    write_catalogue({(64, 19456, 2560, False): {"row": None, "tri": [64, 128, 1, 4, 2]}}, tmp_path)
+    assert (2560, 19456, False) in configured_shapes(tmp_path)
+
+
 def test_bias_and_plain_shapes_are_distinct(tmp_path):
     write_catalogue({(4, 4608, 3584, True): {"row": list(range(16))}}, tmp_path)
     shapes = configured_shapes(tmp_path)

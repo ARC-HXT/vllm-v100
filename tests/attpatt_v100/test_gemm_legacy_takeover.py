@@ -23,7 +23,10 @@ def G(monkeypatch, tmp_path):
     monkeypatch.setattr(G, "ON_SHAPES", ((2560, 6144, False),))
     G.selected = []
     monkeypatch.setattr(G, "_select", lambda dev, M, N, K, bias=False: G.selected.append((M, N, K, bias)) or
-                        dict(M=M, N=N, K=K, bias=bias, row=[9] * 16))
+                        dict(M=M, N=N, K=K, bias=bias, row=[9] * 16, tri_checked=True))
+    G.upgraded = []
+    monkeypatch.setattr(G, "_add_triton", lambda dev, rec: G.upgraded.append((rec["M"], rec["N"], rec["K"])) or
+                        dict(rec, tri_checked=True))
     return G
 
 
@@ -34,6 +37,8 @@ def test_legacy_records_and_shapes_are_taken_over(G, tmp_path):
     (tmp_path / "shapes.json").write_text(json.dumps({"version": 1, "shapes": [[4096, 24576], [2560, 6144]]}))
     out = G.build("cuda:0", ms=[1, 8], cache_dir=str(tmp_path))
     assert G.selected == []                                    # nothing re-selected
+    # taken-over records predate the Triton candidates: those are added (cuBLASLt rows kept, see gemm._add_triton)
+    assert sorted(G.upgraded) == [(1, 6144, 2560), (1, 24576, 4096), (8, 6144, 2560), (8, 24576, 4096)]
     assert out[(1, 24576, 4096, False)]["row"] == [1] * 16     # catalogued shape of the old table carried over
     with open(tmp_path / f"{G.POLICY}.json") as f:
         assert set(json.load(f)) == {"1,24576,4096,0", "8,24576,4096,0", "1,6144,2560,0", "8,6144,2560,0"}
@@ -46,3 +51,4 @@ def test_bias_shapes_are_selected_not_taken_over(G, tmp_path):
     (tmp_path / f"{G.LEGACY_POLICY}.json").write_text(json.dumps({"1,4608,3584": {"row": [1] * 16}}))
     G.build("cuda:0", shapes=[(3584, 4608, True)], ms=[1], cache_dir=str(tmp_path))
     assert G.selected == [(1, 4608, 3584, True)]
+    assert G.upgraded == []  # a fresh selection already includes the Triton candidates

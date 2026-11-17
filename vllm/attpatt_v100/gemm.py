@@ -38,6 +38,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm.attpatt_v100 import gemm_lt as lt
+from vllm.attpatt_v100 import gemm_triton as tri
 from vllm.attpatt_v100.gemm_catalog import (
     configured_shapes,
     default_cache_dir,
@@ -60,9 +61,10 @@ LEGACY_POLICY = "fp32red_rms"  # v0.33.0-v100.7 and earlier: (M, N, K) records, 
 ALIGN = 256  # bytes, for x, weight, bias and y (see gemm)
 CACHE_DIR = default_cache_dir()
 
-_table = {}  # (device index, M, N, K, bias) -> CPU int64 row (16) or None
+_table = {}  # (device index, M, N, K, bias) -> CPU int64 row (16, cuBLASLt), tuple (gemm_triton configuration) or None
 _ready = set()  # device indices whose table is loaded / built for ON_SHAPES
 _ws = {}  # device index -> workspace (uint8), allocated once in prepare()
+_ws32 = {}  # device index -> fp32 split-K workspace of the Triton entries, allocated once in prepare()
 _logged = set()
 
 
@@ -145,61 +147,122 @@ def _fp32_partials(row):
     splitk, red = int(row[11]), int(row[12])
     return splitk <= 1 or red == 2
 
-def _select(dev, M, N, K, bias=False):
-    """returns the cache record of one problem: row (16 ints) or None, plus the measured times and errors.  bias: the
-    operation is F.linear(x, w, b) and the candidates are cuBLASLt algorithms with the bias epilogue"""
-    # inputs are drawn on the GPU: a CPU generator took most of the selection time (the N=248320 weight alone is
-    # 1e9 numbers, single-threaded, while the GPU waited; test_gemm_decode 2026-11-15)
-    g = torch.Generator(device=dev).manual_seed(M * 1000003 + N * 101 + K + (7 if bias else 0))
-    w = torch.randn(N, K, generator=g, device=dev, dtype=torch.float16) / K ** 0.5
-    b = torch.randn(N, generator=g, device=dev, dtype=torch.float16) if bias else None
-    xs = [torch.randn(M, K, generator=g, device=dev, dtype=torch.float16) for _ in range(2)]
-    refs = [x.float() @ w.float().t() + (b.float() if bias else 0) for x in xs]
-    x = xs[0]
-    y = torch.empty(M, N, dtype=torch.float16, device=dev)
-    ws = torch.empty(WS_BYTES, dtype=torch.uint8, device=dev)
-    f_err = [_err(F.linear(xx, w, b), r) for xx, r in zip(xs, refs)]
+class _Problem:
+    """seeded inputs of one selection problem, the fp32 references and F.linear's errors on them"""
 
-    def errs(row):
+    def __init__(self, dev, M, N, K, bias):
+        # inputs are drawn on the GPU: a CPU generator took most of the selection time (the N=248320 weight alone is
+        # 1e9 numbers, single-threaded, while the GPU waited; test_gemm_decode 2026-11-15)
+        g = torch.Generator(device=dev).manual_seed(M * 1000003 + N * 101 + K + (7 if bias else 0))
+        self.w = torch.randn(N, K, generator=g, device=dev, dtype=torch.float16) / K ** 0.5
+        self.b = torch.randn(N, generator=g, device=dev, dtype=torch.float16) if bias else None
+        self.xs = [torch.randn(M, K, generator=g, device=dev, dtype=torch.float16) for _ in range(2)]
+        self.refs = [x.float() @ self.w.float().t() + (self.b.float() if bias else 0) for x in self.xs]
+        self.x = self.xs[0]
+        self.y = torch.empty(M, N, dtype=torch.float16, device=dev)
+        self.ws = torch.empty(WS_BYTES, dtype=torch.uint8, device=dev)
+        self.ws32 = torch.empty(max(1, max((tri.workspace_elems(M, N, c) for c in tri.candidates(M, N, K)),
+                                           default=1)), dtype=torch.float32, device=dev)
+        self.f_err = [_err(F.linear(xx, self.w, self.b), r) for xx, r in zip(self.xs, self.refs)]
+
+    def lt_fn(self, row, x=None):
+        return lambda: lt.matmul(self.x if x is None else x, self.w, self.y, row, self.ws, self.b)
+
+    def tri_fn(self, cfg, x=None):
+        return lambda: tri.matmul(self.x if x is None else x, self.w, self.y, cfg, self.ws32, self.b)
+
+    def errs(self, make_fn):
         out = []
-        for xx, r in zip(xs, refs):
-            lt.matmul(xx, w, y, row, ws, b)
-            out.append(_err(y, r))
+        for xx, r in zip(self.xs, self.refs):
+            make_fn(xx)()
+            out.append(_err(self.y, r))
         return out
 
+    def gated(self, quick, make_fn):
+        """the TOP fastest of quick [(eager us, cand)] that pass the error gate, as [(graph us, cand, errors)]"""
+        quick.sort(key=lambda q: q[0])
+        timed = []
+        for _, c in quick[:TOP]:
+            e = self.errs(lambda xx, c=c: make_fn(c, xx))
+            if all(_not_worse(a, f) for a, f in zip(e, self.f_err)):
+                timed.append((graph_time(make_fn(c)), c, e))
+        timed.sort(key=lambda t: t[0])
+        return timed
+
+
+def _triton_timed(p, M, N, K):
+    """Triton candidates (gemm_triton.candidates) of problem p, fastest first, error-gated"""
+    quick = []
+    for c in tri.candidates(M, N, K):
+        try:
+            quick.append((eager_time(p.tri_fn(c)), c))
+        except Exception:  # noqa: BLE001 - a configuration Triton cannot compile for sm70 (resources): skip it
+            continue
+    return p.gated(quick, lambda c, xx=None: p.tri_fn(c, xx))
+
+
+def _decide(p, rec, lt_arms, tri_arms):
+    """interleaved re-measurement of F.linear, cuBLASLt rows and Triton configurations; fills rec in place:
+    row (cuBLASLt, the default kind) or tri (Triton configuration) for the fastest arm when it beats F.linear by
+    MIN_GAIN, else neither"""
+    arms = [("flinear", make_graph(lambda: F.linear(p.x, p.w, p.b)), None, p.f_err)]
+    arms += [(f"lt{i}", make_graph(p.lt_fn(r)), r, e) for i, (_, r, e) in enumerate(lt_arms[:FINAL])]
+    arms += [(f"tri{i}", make_graph(p.tri_fn(c)), c, e) for i, (_, c, e) in enumerate(tri_arms[:FINAL])]
+    ts = {name: [] for name, _, _, _ in arms}
+    for _ in range(ROUNDS):
+        for name, gr, _, _ in arms:
+            ts[name].append(replay_time(gr))
+    med = {k: sorted(v)[len(v) // 2] for k, v in ts.items()}
+    rec.update(t_flinear=round(med["flinear"], 2), err_flinear=p.f_err, row=None, tri=None, tri_checked=True)
+    best_lt = min((a for a in arms if a[0].startswith("lt")), key=lambda a: med[a[0]], default=None)
+    best_tri = min((a for a in arms if a[0].startswith("tri")), key=lambda a: med[a[0]], default=None)
+    if best_lt is not None:
+        rec.update(t_lt=round(med[best_lt[0]], 2), err_lt=best_lt[3], info=best_lt[2][8:].tolist())
+    if best_tri is not None:
+        rec.update(t_tri=round(med[best_tri[0]], 2), err_tri=best_tri[3], tri_cfg=list(best_tri[2]))
+    best = min(arms[1:], key=lambda a: med[a[0]], default=None)
+    if best is not None and med[best[0]] <= (1 - MIN_GAIN) * med["flinear"]:
+        if best[0].startswith("tri"):
+            rec["tri"] = list(best[2])
+        else:
+            rec["row"] = best[2].tolist()
+    del arms
+
+
+def _select(dev, M, N, K, bias=False):
+    """returns the cache record of one problem: row (16 ints, cuBLASLt) or tri (gemm_triton configuration) or neither,
+    plus the measured times and errors.  bias: the operation is F.linear(x, w, b); cuBLASLt candidates use the bias
+    epilogue, Triton candidates add the bias in fp32 before the single fp16 rounding"""
+    p = _Problem(dev, M, N, K, bias)
     rows = lt.enumerate_algos(M, N, K, WS_BYTES, bias=bias)
     heur = lt.heuristic(M, N, K, WS_BYTES, bias=bias)
     cands = [r.clone() for r in list(rows) + list(heur) if _fp32_partials(r)]
     quick = []
     for r in cands:
         try:
-            quick.append((eager_time(lambda: lt.matmul(x, w, y, r, ws, b)), r))
+            quick.append((eager_time(p.lt_fn(r)), r))
         except RuntimeError:  # a configuration cuBLASLt accepted in the check but refuses to run
             continue
-    quick.sort(key=lambda q: q[0])
-    timed = []
-    for _, r in quick[:TOP]:
-        e = errs(r)
-        if all(_not_worse(a, c) for a, c in zip(e, f_err)):
-            timed.append((graph_time(lambda: lt.matmul(x, w, y, r, ws, b)), r, e))
-    timed.sort(key=lambda t: t[0])
-    arms = [("flinear", make_graph(lambda: F.linear(x, w, b)), None, f_err)]
-    arms += [(f"lt{i}", make_graph((lambda rr: lambda: lt.matmul(x, w, y, rr, ws, b))(r)), r, e)
-             for i, (_, r, e) in enumerate(timed[:FINAL])]
-    ts = {name: [] for name, _, _, _ in arms}
-    for _ in range(ROUNDS):
-        for name, gr, _, _ in arms:
-            ts[name].append(replay_time(gr))
-    med = {k: sorted(v)[len(v) // 2] for k, v in ts.items()}
-    rec = dict(M=M, N=N, K=K, bias=bool(bias), t_flinear=round(med["flinear"], 2), err_flinear=f_err,
-               candidates=len(cands), row=None)
-    best = min(arms[1:], key=lambda a: med[a[0]], default=None)
-    if best is not None:
-        rec.update(t_lt=round(med[best[0]], 2), err_lt=best[3], info=best[2][8:].tolist())
-        if med[best[0]] <= (1 - MIN_GAIN) * med["flinear"]:
-            rec["row"] = best[2].tolist()
-    del arms
+    lt_arms = p.gated(quick, lambda r, xx=None: p.lt_fn(r, xx))
+    rec = dict(M=M, N=N, K=K, bias=bool(bias), candidates=len(cands))
+    _decide(p, rec, lt_arms, _triton_timed(p, M, N, K))
     return rec
+
+
+def _add_triton(dev, rec):
+    """a record selected before the Triton candidates existed (no tri_checked): re-decide between F.linear, its
+    cuBLASLt row and the Triton candidates, keeping the cuBLASLt algorithm already chosen (no re-enumeration)"""
+    M, N, K, bias = rec["M"], rec["N"], rec["K"], bool(rec.get("bias", False))
+    out = dict(rec)
+    p = _Problem(dev, M, N, K, bias)
+    lt_arms = []
+    if rec.get("row") is not None:
+        r = torch.tensor(rec["row"], dtype=torch.int64)
+        lt.prepare(M, N, K, bias)
+        e = p.errs(lambda xx: p.lt_fn(r, xx))
+        lt_arms = [(None, r, e)]
+    _decide(p, out, lt_arms, _triton_timed(p, M, N, K))
+    return out
 
 
 def _cache_file(dev, cache_dir, policy=None):
@@ -294,6 +357,13 @@ def build(dev, shapes=None, ms=CAPTURE_MS, cache_dir=None, select=True):
                     print(json.dumps(recs[k]), flush=True)
                 dirty = True
                 _store(path, {k: recs[k]}, cache_dir)
+            if select and recs[k] is not None and not recs[k].get("tri_checked") and M <= tri.MAX_M:
+                # selected before the Triton candidates existed: add them without re-enumerating cuBLASLt
+                with torch.cuda.device(dev):
+                    recs[k] = _add_triton(dev, {**recs[k], "M": M, "N": N, "K": K, "bias": bias})
+                print(json.dumps(recs[k]), flush=True)
+                dirty = True
+                _store(path, {k: recs[k]}, cache_dir)
             out[k] = recs[k]
     if dirty:
         _log(f"selected missing entries in {time.time() - t0:.0f} s -> {path}")
@@ -311,8 +381,15 @@ def prepare(dev):
     if i in _ready:
         return
     recs = build(torch.device("cuda", i), select=False)  # engine start never selects: cache or F.linear
-    need = 0
+    need, need32, n_tri = 0, 0, 0
     for (M, N, K, bias), r in recs.items():
+        if r is not None and r.get("tri") is not None:
+            cfg = tuple(int(v) for v in r["tri"])
+            tri.warmup(M, N, K, cfg, bias)  # compiled here, never under graph capture
+            _table[(i, M, N, K, bias)] = cfg
+            need32 = max(need32, tri.workspace_elems(M, N, cfg))
+            n_tri += 1
+            continue
         row = None if r is None or r.get("row") is None else torch.tensor(r["row"], dtype=torch.int64)
         _table[(i, M, N, K, bias)] = row
         if row is not None:
@@ -320,9 +397,12 @@ def prepare(dev):
             need = max(need, int(row[15]))
     if i not in _ws:
         _ws[i] = torch.empty(max(need, 256), dtype=torch.uint8, device=torch.device("cuda", i))
+    if i not in _ws32:
+        _ws32[i] = torch.empty(max(need32, 64), dtype=torch.float32, device=torch.device("cuda", i))
     _ready.add(i)
     used = sum(1 for k, v in _table.items() if k[0] == i and v is not None)
-    _log(f"table ready on cuda:{i}: {used} of {len(recs)} (M, N, K, bias) entries use cuBLASLt, workspace {need} B")
+    _log(f"table ready on cuda:{i}: {used} of {len(recs)} (M, N, K, bias) entries use the table ({n_tri} Triton, "
+         f"{used - n_tri} cuBLASLt), workspace {need} B + {4 * max(need32, 64)} B fp32")
 
 
 def entry(dev, M, N, K, bias=False):
@@ -330,8 +410,8 @@ def entry(dev, M, N, K, bias=False):
 
 
 def gemm(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
-    """y = x @ weight^T (+ bias) for the ON_SHAPES; table entry -> cuBLASLt algo (bias in its epilogue), otherwise
-    F.linear"""
+    """y = x @ weight^T (+ bias) for the ON_SHAPES; table entry -> cuBLASLt algo (bias in its epilogue) or Triton
+    configuration (gemm_triton, bias before the single rounding), otherwise F.linear"""
     N, K = weight.shape
     i = x.device.index
     if i not in _ready:
@@ -354,7 +434,10 @@ def gemm(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
     y = torch.empty((*x.shape[:-1], N), dtype=x.dtype, device=x.device)
     if y.data_ptr() % ALIGN:
         return F.linear(x, weight, bias)
-    lt.matmul(x.view(M, K), weight, y.view(M, N), row, _ws[i], bias)
+    if isinstance(row, tuple):
+        tri.matmul(x.view(M, K), weight, y.view(M, N), row, _ws32[i], bias)
+    else:
+        lt.matmul(x.view(M, K), weight, y.view(M, N), row, _ws[i], bias)
     return y
 
 

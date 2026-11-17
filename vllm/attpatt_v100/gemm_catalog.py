@@ -62,12 +62,13 @@ def fingerprint(cache_dir=None):
 
 
 def write_catalogue(records, cache_dir=None):
-    """records: {(M, N, K, bias): record}; a shape is listed when some M has an accepted row"""
+    """records: {(M, N, K, bias): record}; a shape is listed when some M has an accepted cuBLASLt row or Triton
+    configuration (gemm_triton)"""
     shapes = sorted(
         {
             (int(k), int(n), int(bool(b)))
             for (_, n, k, b), record in records.items()
-            if record is not None and record.get("row") is not None
+            if record is not None and (record.get("row") is not None or record.get("tri") is not None)
         }
     )
     path = Path(cache_dir or default_cache_dir()) / "shapes.json"

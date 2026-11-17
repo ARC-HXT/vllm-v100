@@ -147,7 +147,7 @@ def test_build_cli_selects_the_enumerated_shapes(tiny_qwen2, tmp_path, monkeypat
     seen = []
     monkeypatch.setattr(G, "CACHE_DIR", str(tmp_path))
     monkeypatch.setattr(G, "_select", lambda dev, M, N, K, bias=False: seen.append((K, N, bias, M)) or
-                        dict(M=M, N=N, K=K, bias=bias, row=None))
+                        dict(M=M, N=N, K=K, bias=bias, row=None, tri_checked=True))
     G.main(["build", "--model", tiny_qwen2, "--tp", "2", "--ms", "1,8"])
     assert sorted({s[:3] for s in seen}) == expected(2)
     assert {s[3] for s in seen} == {1, 8}
