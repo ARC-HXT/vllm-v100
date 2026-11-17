@@ -227,9 +227,10 @@ def _official_llada_rope(q, k, theta, dim):
 
 @pytest.fixture
 def vllm_config_ctx():
-    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 
-    with set_current_vllm_config(VllmConfig()):
+    # device="cpu": the CPU Actions job has no platform to infer it from.
+    with set_current_vllm_config(VllmConfig(device_config=DeviceConfig("cpu"))):
         yield
 
 

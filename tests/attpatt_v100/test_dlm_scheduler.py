@@ -21,6 +21,7 @@ MASK = 99
 def _scheduler(tmp_path, *, budget=4096, async_scheduling=False, max_model_len=1024):
     from vllm.config import (
         CacheConfig,
+        DeviceConfig,
         ModelConfig,
         SchedulerConfig,
         VllmConfig,
@@ -54,6 +55,7 @@ def _scheduler(tmp_path, *, budget=4096, async_scheduling=False, max_model_len=1
         max_model_len=max_model_len,
     )
     vllm_config = VllmConfig(
+        device_config=DeviceConfig("cpu"),
         model_config=model_config,
         scheduler_config=SchedulerConfig(
             max_num_seqs=8,

@@ -20,6 +20,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+# The skip check below initializes CUDA in this process.
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 MODEL = os.environ.get("DLM_MODEL", "llada")
 WEIGHTS = {
     "llada": os.environ.get(
