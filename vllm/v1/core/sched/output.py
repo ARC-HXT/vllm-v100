@@ -324,6 +324,10 @@ class SchedulerOutput:
     # drafter can skip proposing them.
     skip_drafts: bool = False
 
+    # Full-sequence diffusion: request id -> index of the denoising step this
+    # output runs (0-based). The worker never infers it.
+    dlm_steps: dict[str, int] | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

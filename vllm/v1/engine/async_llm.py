@@ -696,7 +696,11 @@ class AsyncLLM(EngineClient):
         return queue
 
     def _validate_resumable_request(self) -> None:
-        if self.vllm_config.is_mm_encoder_only or self.model_config.is_diffusion:
+        if (
+            self.vllm_config.is_mm_encoder_only
+            or self.model_config.is_diffusion
+            or self.model_config.is_full_sequence_diffusion
+        ):
             raise VLLMValidationError(
                 "Resumable requests are not supported for encoder-only or "
                 "diffusion models."

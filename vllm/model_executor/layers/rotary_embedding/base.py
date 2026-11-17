@@ -17,6 +17,10 @@ class RotaryEmbeddingBase(CustomOp):
 
     # --8<-- [end:rotary_embedding]
 
+    # Keep the cos/sin cache in fp32 and rotate q/k in fp32 (cast back once),
+    # as LLaDA's `rope_full_precision` does. Set by get_rope(fp32_compute=True).
+    fp32_compute: bool = False
+
     def __init__(
         self,
         head_size: int,
@@ -106,9 +110,10 @@ class RotaryEmbeddingBase(CustomOp):
         # __setattr__ in nn.Module (called by `self.cos_sin_cache = ...`)
         # is expensive, so avoid calling it if possible
         cos_sin_cache = self.cos_sin_cache
+        cache_dtype = torch.float32 if self.fp32_compute else query.dtype
         if (
             cos_sin_cache.device == query.device
-            and self.cos_sin_cache.dtype == query.dtype
+            and self.cos_sin_cache.dtype == cache_dtype
         ):
             return cos_sin_cache
 
@@ -122,7 +127,7 @@ class RotaryEmbeddingBase(CustomOp):
             if cache_bf16 is not None and cache_bf16.device == query.device:
                 return cache_bf16
 
-        cos_sin_cache = cos_sin_cache.to(query.device, dtype=query.dtype)
+        cos_sin_cache = cos_sin_cache.to(query.device, dtype=cache_dtype)
         # Avoid mutating buffers during torch.compile (cudagraph) tracing.
         if torch.compiler.is_compiling():
             return cos_sin_cache
@@ -166,6 +171,7 @@ class RotaryEmbedding(RotaryEmbeddingBase):
         rotary_dim: int,
         cos_sin_cache: torch.Tensor,
         is_neox_style: bool,
+        enable_fp32_compute: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """A PyTorch-native implementation of forward()."""
         positions = positions.flatten()
@@ -182,6 +188,7 @@ class RotaryEmbedding(RotaryEmbeddingBase):
             cos,
             sin,
             is_neox_style,
+            enable_fp32_compute,
         )
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
 
@@ -196,6 +203,7 @@ class RotaryEmbedding(RotaryEmbeddingBase):
                 cos,
                 sin,
                 is_neox_style,
+                enable_fp32_compute,
             )
             key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
@@ -216,6 +224,7 @@ class RotaryEmbedding(RotaryEmbeddingBase):
             self.rotary_dim,
             cos_sin_cache,
             self.is_neox_style,
+            self.fp32_compute,
         )
 
     def forward_cuda(

@@ -156,6 +156,8 @@ _TEXT_GENERATION_MODELS = {
     "Llama4ForCausalLM": ("llama4", "Llama4ForCausalLM"),
     # For decapoda-research/llama-*
     "LLaMAForCausalLM": ("llama", "LlamaForCausalLM"),
+    # Full-sequence masked diffusion (bidirectional, whole canvas per step)
+    "LLaDAModelLM": ("llada", "LLaDAModelLM"),
     "LongcatFlashForCausalLM": ("longcat_flash", "LongcatFlashForCausalLM"),
     "LongcatFlashNgramForCausalLM": (
         "longcat_flash_ngram",
@@ -198,6 +200,8 @@ _TEXT_GENERATION_MODELS = {
     "PhiMoEForCausalLM": ("phimoe", "PhiMoEForCausalLM"),
     "Plamo3ForCausalLM": ("plamo3", "Plamo3ForCausalLM"),
     "Qwen2ForCausalLM": ("qwen2", "Qwen2ForCausalLM"),
+    # Full-sequence masked diffusion (bidirectional, whole canvas per step)
+    "DreamModel": ("dream", "DreamModel"),
     "Qwen2MoeForCausalLM": ("qwen2_moe", "Qwen2MoeForCausalLM"),
     "Qwen3ForCausalLM": ("qwen3", "Qwen3ForCausalLM"),
     "Qwen3MoeForCausalLM": ("qwen3_moe", "Qwen3MoeForCausalLM"),

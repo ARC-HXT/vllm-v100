@@ -1317,7 +1317,7 @@ class VllmConfig:
                 "requires fixed verification boundaries; disable adaptive "
                 "verification"
             )
-        if model_config.is_diffusion:
+        if model_config.is_diffusion or model_config.is_full_sequence_diffusion:
             raise ValueError(
                 "sampling distribution replay does not support diffusion models"
             )
@@ -3136,7 +3136,10 @@ class VllmConfig:
         if self._is_dflash_candidate_draft():
             unsupported.append("DFlash candidate-head drafts")
 
-        if self.model_config is not None and self.model_config.is_diffusion:
+        if self.model_config is not None and (
+            self.model_config.is_diffusion
+            or self.model_config.is_full_sequence_diffusion
+        ):
             unsupported.append("diffusion models")
 
         if self.parallel_config.enable_batch_sharded_sampling:

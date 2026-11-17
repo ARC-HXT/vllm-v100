@@ -37,6 +37,7 @@ def get_rope(
     dtype: torch.dtype | None = None,
     dual_chunk_attention_config: dict[str, Any] | None = None,
     mrope_positions_factor: int = 4,
+    fp32_compute: bool = False,
 ) -> RotaryEmbedding:
     if dtype is None:
         dtype = torch.get_default_dtype()
@@ -80,6 +81,7 @@ def get_rope(
         dual_chunk_attention_args,
         dtype,
         mrope_positions_factor,
+        fp32_compute,
     )
     if key in _ROPE_DICT:
         return _ROPE_DICT[key]
@@ -348,5 +350,9 @@ def get_rope(
             raise ValueError("Pangu mrope lacks necessary parameters.")
     else:
         raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+    if fp32_compute:
+        if type(rotary_emb) is not RotaryEmbedding or dtype != torch.float32:
+            raise ValueError("fp32_compute needs default RoPE with dtype=float32")
+        rotary_emb.fp32_compute = True
     _ROPE_DICT[key] = rotary_emb
     return rotary_emb

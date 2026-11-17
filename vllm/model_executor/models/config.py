@@ -464,6 +464,119 @@ class DiffusionGemmaModelForBlockDiffusionConfig(VerifyAndUpdateConfig):
             )
 
 
+class FullSequenceDiffusionConfig(VerifyAndUpdateConfig):
+    """LLaDA / Dream: masked diffusion that re-runs the whole sequence
+    (prompt + canvas) bidirectionally at every denoising step.
+
+    ``is_causal=False`` makes the Llama / Qwen2 layers use EncoderOnlyAttention,
+    so the engine holds no KV cache and the model's own ModelState
+    (``FullSeqDiffusionModelState``) is selected. ``full_sequence_diffusion``
+    is the flag the engine keys on (``ModelConfig.is_full_sequence_diffusion``);
+    ``is_diffusion`` (DiffusionGemma) is left untouched.
+    """
+
+    family: str = ""
+
+    @classmethod
+    def verify_and_update_model_config(cls, model_config: "ModelConfig") -> None:
+        hf_config = model_config.hf_config
+        if getattr(hf_config, "mask_token_id", None) is None:
+            raise ValueError(f"{cls.family}: config.json has no mask_token_id")
+        hf_config.is_causal = False
+        hf_config.full_sequence_diffusion = cls.family
+        # Plan section 2.9: the lm_head writes fp32 logits (HMMA fp32
+        # accumulation, no fp16 rounding) and all sampling runs in fp32.
+        if getattr(hf_config, "head_dtype", None) is None:
+            hf_config.head_dtype = "float32"
+        cls.convert_hf_config(hf_config)
+        cls.set_generation_defaults(model_config)
+
+    @staticmethod
+    def convert_hf_config(hf_config: "PreTrainedConfig") -> None:
+        return
+
+    @staticmethod
+    def set_generation_defaults(model_config: "ModelConfig") -> None:
+        return
+
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        name = vllm_config.model_config.architecture
+        parallel_config = vllm_config.parallel_config
+        unsupported = []
+        if parallel_config.pipeline_parallel_size > 1:
+            unsupported.append("pipeline parallelism")
+        if parallel_config.data_parallel_size > 1:
+            unsupported.append("data parallelism")
+        if parallel_config.enable_batch_sharded_sampling:
+            unsupported.append("batch-sharded sampling")
+        if vllm_config.diffusion_config is not None:
+            unsupported.append("--diffusion-config (DiffusionGemma only)")
+        if vllm_config.speculative_config is not None:
+            unsupported.append("speculative decoding")
+        if vllm_config.lora_config is not None:
+            unsupported.append("LoRA")
+        if unsupported:
+            raise ValueError(f"{name} does not support: {', '.join(unsupported)}")
+        if not vllm_config.use_v2_model_runner:
+            raise ValueError(f"{name} needs Model Runner V2 (VLLM_USE_V2_MODEL_RUNNER)")
+        # The prompt's hidden states depend on the canvas (bidirectional), so
+        # nothing is a function of a prefix; there is no KV cache either.
+        if vllm_config.cache_config.enable_prefix_caching:
+            logger.info("%s: disabling prefix caching (no KV cache).", name)
+            vllm_config.cache_config.enable_prefix_caching = False
+
+
+class LLaDAModelLMConfig(FullSequenceDiffusionConfig):
+    family = "llada"
+
+    @staticmethod
+    def convert_hf_config(hf_config: "PreTrainedConfig") -> None:
+        # LLaDAConfig (configuration_llada.py) keeps OLMo names; only the
+        # Llama block layout is supported (config.json `block_type: llama`).
+        expected = {
+            "block_type": "llama",
+            "rope": True,
+            "alibi": False,
+            "weight_tying": False,
+            "scale_logits": False,
+            "input_emb_norm": False,
+            "attention_layer_norm": False,
+            "include_bias": False,
+            "include_qkv_bias": False,
+            "layer_norm_type": "rms",
+            "activation_type": "silu",
+        }
+        for key, value in expected.items():
+            if getattr(hf_config, key, value) != value:
+                raise ValueError(
+                    f"LLaDA: unsupported config {key}={getattr(hf_config, key)!r}"
+                )
+        hf_config.num_key_value_heads = hf_config.n_kv_heads or hf_config.n_heads
+        hf_config.intermediate_size = hf_config.mlp_hidden_size
+        hf_config.hidden_act = "silu"
+        # LLaDAConfig does not define tie_word_embeddings, and transformers'
+        # default is True; the checkpoint has a separate output head
+        # (`model.transformer.ff_out`, weight_tying false).
+        hf_config.tie_word_embeddings = False
+        hf_config.attention_bias = False
+        hf_config.max_position_embeddings = hf_config.max_sequence_length
+        hf_config.rope_parameters = {
+            "rope_type": "default",
+            "rope_theta": hf_config.rope_theta,
+        }
+
+    @staticmethod
+    def set_generation_defaults(model_config: "ModelConfig") -> None:
+        # Official generate() samples greedily by default (generate.py:96-97);
+        # LLaDA's generation_config.json does not say so.
+        model_config.override_generation_config.setdefault("temperature", 0.0)
+
+
+class DreamModelConfig(FullSequenceDiffusionConfig):
+    family = "dream"
+
+
 class DeepseekV4ForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
@@ -1218,6 +1331,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "DeepseekV41ForCausalLM": DeepseekV4ForCausalLMConfig,
     "DeepseekV32ForCausalLM": DeepseekV32ForCausalLM,
     "DiffusionGemmaForBlockDiffusion": DiffusionGemmaModelForBlockDiffusionConfig,  # noqa: E501
+    "DreamModel": DreamModelConfig,
     "EmbeddingGemma2Model": EmbeddingGemma2ModelConfig,
     "Ernie4_5_VLMoeForConditionalGeneration": Ernie4_5_VLMoeForConditionalGenerationConfig,  # noqa: E501
     "FalconMambaForCausalLM": MambaModelConfig,
@@ -1239,6 +1353,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "JinaVLForRanking": JinaVLForSequenceClassificationConfig,
     "KimiK3ForConditionalGeneration": KimiK3ForConditionalGenerationConfig,
     "KimiK3MTPModel": KimiK3ForConditionalGenerationConfig,
+    "LLaDAModelLM": LLaDAModelLMConfig,
     "LlamaBidirectionalForSequenceClassification": LlamaBidirectionalConfig,
     "LlamaBidirectionalModel": LlamaBidirectionalConfig,
     "LlamaNemotronVLForSequenceClassification": LlamaNemotronVLConfig,

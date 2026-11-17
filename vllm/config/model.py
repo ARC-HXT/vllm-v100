@@ -1961,6 +1961,17 @@ class ModelConfig:
         return getattr(self.hf_config, "canvas_length", None) is not None
 
     @property
+    def full_sequence_diffusion(self) -> str | None:
+        """Model family ("llada" / "dream") of a full-sequence masked diffusion
+        model, which re-runs prompt + canvas bidirectionally every step; set by
+        its config hook (models/config.py:FullSequenceDiffusionConfig)."""
+        return getattr(self.hf_config, "full_sequence_diffusion", None)
+
+    @property
+    def is_full_sequence_diffusion(self) -> bool:
+        return self.full_sequence_diffusion is not None
+
+    @property
     def uses_alibi(self) -> bool:
         cfg = self.hf_text_config
 

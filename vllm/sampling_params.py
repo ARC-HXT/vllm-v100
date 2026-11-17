@@ -1227,7 +1227,7 @@ class SamplingParams(
         if structured_outputs_config is None or self.structured_outputs is None:
             return
 
-        if model_config.is_diffusion:
+        if model_config.is_diffusion or model_config.is_full_sequence_diffusion:
             # Diffusion LLMs denoise a whole canvas of tokens in parallel
             # rather than sampling left-to-right, which the grammar FSM
             # requires. Without this check, requests fail mid-generation
@@ -1536,7 +1536,10 @@ class BeamSearchParams(
             raise ValueError(
                 "Beam allowlists with speculative decoding are not supported"
             )
-        if config.model_config.is_diffusion:
+        if (
+            config.model_config.is_diffusion
+            or config.model_config.is_full_sequence_diffusion
+        ):
             # The diffusion sampler does not consume logprob_token_ids.
             raise ValueError("Beam allowlists with diffusion models are not supported")
         if not config.use_v2_model_runner:

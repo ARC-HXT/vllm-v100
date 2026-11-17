@@ -44,6 +44,7 @@ from vllm.tasks import POOLING_TASKS, SupportedTask
 from vllm.tracing import instrument, maybe_init_worker_tracer
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
 from vllm.utils import numa_utils
+from vllm.utils.diffusion import expand_full_sequence_diffusion_prompt
 from vllm.utils.gc_utils import (
     freeze_gc_heap,
     maybe_attach_gc_debug_callback,
@@ -1137,7 +1138,14 @@ class EngineCore:
                 request.mm_features
             )
 
+        dlm_steps = 0
+        model_config = self.vllm_config.model_config
+        if model_config.is_full_sequence_diffusion:
+            dlm_steps = expand_full_sequence_diffusion_prompt(
+                request, model_config.hf_config.mask_token_id
+            )
         req = Request.from_engine_core_request(request, self.request_block_hasher)
+        req.dlm_total_steps = dlm_steps
         if req.use_structured_output:
             # Note on thread safety: no race condition.
             # `grammar_init` is only invoked in input processing thread. For

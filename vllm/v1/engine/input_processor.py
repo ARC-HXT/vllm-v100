@@ -30,7 +30,10 @@ from vllm.tasks import GENERATION_TASKS, POOLING_TASKS, SupportedTask
 from vllm.tokenizers import TokenizerLike
 from vllm.utils import length_from_prompt_token_ids_or_embeds, random_uuid
 from vllm.utils.async_utils import make_async
-from vllm.utils.diffusion import validate_diffusion_sampling_params
+from vllm.utils.diffusion import (
+    normalize_full_sequence_diffusion_params,
+    validate_diffusion_sampling_params,
+)
 from vllm.utils.jsontree import json_iter_leaves
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.kv_hints import KvHintsEnvelope
@@ -473,6 +476,11 @@ class InputProcessor:
                         parameter="prompt_logprob_token_ids",
                         value=len(rows),
                     )
+            if self.model_config.is_full_sequence_diffusion:
+                assert prompt_token_ids is not None
+                self._normalize_full_sequence_diffusion(
+                    sampling_params, prompt_token_ids
+                )
             # If unset max tokens, then generate up to the max_model_len.
             if sampling_params.max_tokens is None:
                 sampling_params.max_tokens = (
@@ -552,6 +560,29 @@ class InputProcessor:
             resumable=resumable,
             session_id=session_id,
             kv_hints=kv_hints,
+        )
+
+    def _normalize_full_sequence_diffusion(
+        self, params: SamplingParams, prompt_token_ids: list[int]
+    ) -> None:
+        model_config = self.model_config
+        scheduler_config = self.scheduler_config
+        normalize_full_sequence_diffusion_params(
+            params,
+            family=model_config.full_sequence_diffusion,
+            prompt_token_ids=prompt_token_ids,
+            mask_token_id=model_config.hf_config.mask_token_id,
+            generation_config=self.generation_config_fields,
+            max_model_len=model_config.max_model_len,
+            max_position=getattr(
+                model_config.hf_text_config,
+                "max_position_embeddings",
+                model_config.max_model_len,
+            ),
+            max_num_scheduled_tokens=(
+                scheduler_config.max_num_scheduled_tokens
+                or scheduler_config.max_num_batched_tokens
+            ),
         )
 
     def _validate_prompt_len(
