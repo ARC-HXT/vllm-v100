@@ -24,7 +24,7 @@ jobs:
     env:
       VLLM_TARGET_DEVICE: cuda
       TORCH_CUDA_ARCH_LIST: '7.0'
-      VLLM_VERSION_OVERRIDE: 0.33.0+v100.9
+      VLLM_VERSION_OVERRIDE: 0.33.0+v100.10
       VLLM_USE_PRECOMPILED: '0'
       NVCC_THREADS: '1'
       CCACHE_DIR: ${{ github.workspace }}/.ccache

@@ -64,6 +64,16 @@ dtypes and sizes outside the table fall back to `F.linear`.
 Measured on V100 at the profiled production batch (graph sizes 168 / 176 / 184): qkv about 15 % and down about 8 %
 faster; at batch 256 neither shape gains and both fall back.
 
+Since v0.33.0+v100.10 the candidates of every M <= 256 also include Triton kernels (`vllm/attpatt_v100/gemm_triton.py`:
+the whole M in one tile so each weight element is read once, fp32 split-K partial sums added in a fixed order, the bias
+added before the single fp16 rounding), timed in the same interleaved re-measurement and held to the same error gate;
+a record names either a cuBLASLt algorithm (`row`) or a Triton configuration (`tri`). `prepare()` compiles every chosen
+Triton variant before CUDA graph capture. Building over an older table is incremental: records without `tri_checked`
+get the Triton candidates added (their cuBLASLt algorithm is kept as one arm, cuBLASLt is not re-enumerated), about
+10 s per record on a V100. Qwen3-4B decode, 131072 KV tokens in use (V100 2026-11-18, same code, table with vs without
+Triton entries for M 16 / 32 / 64): 40.66 -> 40.03, 42.70 -> 41.82, 50.41 -> 45.06 ms per step at 16 / 32 / 64 running
+requests.
+
 ## Build and artifacts (GitHub Actions)
 
 `.github/workflows/attpatt-v100-wheel.yml` builds the complete CUDA wheel from
@@ -132,6 +142,7 @@ skipped there.
 ## Known limits
 
 - sm70 / fp16 only; the kernels are not tuned or tested on other GPUs.
-- GEMM: one cuBLASLt workspace per device, shared by all table GEMMs; this assumes they run on one stream (true for
+- GEMM: one cuBLASLt workspace and one fp32 Triton split-K workspace per device, shared by all table GEMMs; this
+  assumes they run on one stream (true for
   vLLM's dense decoder models). Only shapes built offline (plus the two legacy Qwen3-4B shapes) are in the table.
 - Split-KV scratch is allocated outside `gpu_memory_utilization` (see the table above).
