@@ -181,6 +181,10 @@ class StreamingUpdate:
 
 
 class RequestState:
+    # Full-sequence diffusion trajectory (arrives with the final output);
+    # a class default so states built without __init__ have it too.
+    dlm_trace: dict[str, np.ndarray] | None = None
+
     def __init__(
         self,
         request_id: str,
@@ -237,8 +241,6 @@ class RequestState:
 
         # Routed experts accumulation (prompt + sample chunks)
         self.routed_experts_chunks: list[np.ndarray] = []
-        # Full-sequence diffusion trajectory (arrives with the final output).
-        self.dlm_trace: dict[str, np.ndarray] | None = None
         self.sampling_mask_chunks: list[SamplingMaskLists] = []
         # (weight version, first output-token index) for each span.
         self.weight_version_starts: list[tuple[str, int]] = []

@@ -37,6 +37,10 @@ REPORT = os.environ.get("DLM_GPU_REPORT")
 # Reference sets per model and the items of the parity gate (ref/README).
 REF_SETS = {"llada": ["llada_b32", "llada"], "dream": ["dream"]}
 GATE_ITEMS = range(4)
+# Replay other items, e.g. to explain an end-to-end difference: "12,13".
+REPLAY_ITEMS = [
+    int(i) for i in os.environ.get("DLM_REPLAY_ITEMS", "0,1,2,3").split(",")
+]
 REPLAY = "tests.attpatt_v100.dlm_replay:ReplayPolicy"
 
 pytestmark = [
@@ -150,7 +154,7 @@ def ref_reveals(ref: dict) -> np.ndarray:
 
 @pytest.mark.parametrize("ref_set", REF_SETS[MODEL])
 def test_trajectory_replay(llm, ref_set, tmp_path):
-    refs = [load_ref(ref_set, i) for i in GATE_ITEMS]
+    refs = [load_ref(ref_set, i) for i in REPLAY_ITEMS]
     meta = refs[0]["meta"]
     inner = ref_extra(meta)["diffusion_policy"]
     params = []
@@ -219,7 +223,7 @@ def test_trajectory_replay(llm, ref_set, tmp_path):
         record = {
             "test": "replay",
             "set": ref_set,
-            "item": i,
+            "item": REPLAY_ITEMS[i],
             "steps": steps,
             "top1_agree": float(top1_agree.mean()),
             "steps_with_top1_diff": int((~top1_agree).any(1).sum()),
@@ -229,7 +233,20 @@ def test_trajectory_replay(llm, ref_set, tmp_path):
             "reveal_steps_equal": steps - len(bad_steps),
             "reveal_diff_details": details,
         }
+        # Where the reveal set differs, the same tokens are revealed in a
+        # different order (a confidence near-tie under fp16 forward
+        # rounding), never a different token.
+        swapped_x0_differs = [
+            k
+            for k in bad_steps
+            if (
+                ours_x0[k, ours_reveal[k] ^ reveals[k]]
+                != ref_top1[k, ours_reveal[k] ^ reveals[k]]
+            ).any()
+        ]
+        record["steps_with_swapped_x0_diff"] = swapped_x0_differs
         report(record)
+        assert not swapped_x0_differs
 
 
 # --------------------------------------------------------------------------
@@ -263,6 +280,9 @@ def test_end_to_end_parity(llm, ref_set):
         )
     report({"test": "e2e_summary", "set": ref_set, "n": n,
             "exact": sum(exact), "sec": round(sec, 1)})  # fmt: skip
+    if ref_set == "llada_b32":
+        # The non-degenerate LLaDA parity config matches token for token.
+        assert all(exact)
 
 
 # --------------------------------------------------------------------------
@@ -344,9 +364,11 @@ def test_batch_matches_single_runs(llm):
         "j0", TokensPrompt(prompt_token_ids=list(map(int, prompts[0]))), params[0]
     )
     late: dict[str, list[int]] = {}
+    seen: list[tuple[str, bool]] = []
     steps_run = 0
-    while engine.has_unfinished_requests():
+    while len(late) < 2 and steps_run < 5000:
         for out in engine.step():
+            seen.append((out.request_id, out.finished))
             if out.finished:
                 late[out.request_id] = out.outputs[0].token_ids
         steps_run += 1
@@ -358,10 +380,17 @@ def test_batch_matches_single_runs(llm):
             )
     same_batch = [list(s) == list(t) for s, t in zip(single, together)]
     same_late = [
-        list(late["j0"]) == list(single[0]),
-        list(late["j3"]) == list(single[3]),
+        list(late.get(r, [])) == list(single[i]) for r, i in (("j0", 0), ("j3", 3))
     ]
-    report({"test": "batch", "same_batched": same_batch, "same_mid_join": same_late})
+    report(
+        {
+            "test": "batch",
+            "same_batched": same_batch,
+            "same_mid_join": same_late,
+            "engine_steps": steps_run,
+            "outputs_seen": seen[-6:],
+        }
+    )
     assert all(same_batch) and all(same_late)  # fmt: skip
 
 
@@ -400,7 +429,7 @@ def test_custom_policy_in_the_worker(llm):
         meta,
         diffusion_policy=EDIT,
         diffusion_block_length=ref_gen_len(meta),
-        diffusion_policy_args={"rewrite_gain": 0.5, "remask_logp": -3.0,
+        diffusion_policy_args={"rewrite_gain": 0.0, "remask_logp": -0.5,
                                "feature_weight": 0.01},
         diffusion_trace=True,
         diffusion_trace_topk=1,
