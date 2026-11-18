@@ -187,3 +187,105 @@ def test_preemption_restarts_the_step_count(tmp_path):
     out = sched.schedule()
     assert out.dlm_steps == {"r": 0}
     assert out.num_scheduled_tokens == {"r": 12}
+
+
+def _engine_output(sched_out, sampler_out):
+    """ModelRunnerOutput from the sampler's output, as the runner builds it:
+    each request reports its first num_sampled tokens."""
+    from vllm.v1.outputs import ModelRunnerOutput
+
+    req_ids = list(sched_out.num_scheduled_tokens)
+    sampled = [
+        sampler_out.sampled_token_ids[i, : int(sampler_out.num_sampled[i])].tolist()
+        for i in range(len(req_ids))
+    ]
+    return ModelRunnerOutput(
+        req_ids=req_ids,
+        req_id_to_index={r: i for i, r in enumerate(req_ids)},
+        sampled_token_ids=sampled,
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+
+def test_policy_failing_on_the_worker_frees_the_request(tmp_path):
+    """The worker cannot load the request's policy (add_request), so the
+    sampler never steps it and its last step returns no tokens. The scheduler
+    must finish it as an error and drop it from running, or the engine keeps
+    stepping an unfinished request forever."""
+    from tests.attpatt_v100.dlm_harness import Run, ToyLM, make_sampler
+    from tests.attpatt_v100.dlm_harness import normalized_params as admitted
+    from vllm.v1.engine import FinishReason
+
+    P, G, S = 4, 8, 2
+    sched = _scheduler(tmp_path)
+    req = _request("r", P, G, S)
+    sched.add_request(req)
+    params = admitted(
+        "llada",
+        list(range(10, 10 + P)),
+        G,
+        extra_args={
+            "diffusion_policy": "tests.attpatt_v100.test_dlm_plugins:BrokenOnWorker",
+            "diffusion_max_steps": S,
+            "diffusion_block_length": G,
+        },
+    )
+    sampler = make_sampler("llada")
+    run = Run(sampler, {"r": ToyLM(sampler.vocab_size)})
+    run.add("r", 0, list(range(10, 10 + P)), params)
+    for _ in range(S):
+        out = sched.schedule()
+        assert out.num_scheduled_tokens == {"r": P + G}
+        sampler_out = run.step(dict(out.dlm_steps))
+        sched.update_from_output(out, _engine_output(out, sampler_out))
+    assert req.is_finished()
+    assert req.get_finished_reason() == FinishReason.ERROR
+    assert req not in sched.running
+    assert sched.get_num_unfinished_requests() == 0
+    assert not sched.schedule().num_scheduled_tokens
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_abort_mid_run(tmp_path, async_scheduling):
+    """Plan 2.2.2 item 6: an abort between steps frees the request; with async
+    scheduling the output of the step already in flight is ignored."""
+    from vllm.v1.request import RequestStatus
+
+    sched = _scheduler(tmp_path, async_scheduling=async_scheduling)
+    req = _request("r", 4, 8, 5)
+    sched.add_request(req)
+    out0 = sched.schedule()
+    sched.update_from_output(out0, _output(out0, {}))
+    out1 = sched.schedule()
+    assert out1.dlm_steps == {"r": 1}
+    sched.finish_requests("r", RequestStatus.FINISHED_ABORTED)
+    assert req.is_finished() and req not in sched.running
+    sched.update_from_output(out1, _output(out1, {"r": list(range(30, 38))}))
+    assert req.dlm_steps_done == 1
+    assert list(req.output_token_ids) == []
+    assert sched.get_num_unfinished_requests() == 0
+    assert not sched.schedule().num_scheduled_tokens
+
+
+def test_async_preemption_drops_the_in_flight_outputs(tmp_path):
+    """Async scheduling runs one step ahead. When the request is preempted
+    the outputs of both in-flight steps belong to the old run: they must not
+    advance the step count, add to the trajectory or finish the request."""
+    sched = _scheduler(tmp_path, async_scheduling=True)
+    P, G, S = 4, 8, 2
+    req = _request("r", P, G, S)
+    sched.add_request(req)
+    out0 = sched.schedule()
+    out1 = sched.schedule()  # one step ahead
+    assert (out0.dlm_steps, out1.dlm_steps) == ({"r": 0}, {"r": 1})
+    sched.running.remove(req)
+    sched._preempt_request(req, 0.0)
+    sched.update_from_output(out0, _output(out0, {}))
+    sched.update_from_output(out1, _output(out1, {"r": list(range(30, 30 + G))}))
+    assert req.dlm_steps_done == 0 and req.dlm_trace is None
+    assert not req.is_finished() and list(req.output_token_ids) == []
+    out = sched.schedule()
+    assert out.dlm_steps == {"r": 0}
+    assert out.num_scheduled_tokens == {"r": P + G}

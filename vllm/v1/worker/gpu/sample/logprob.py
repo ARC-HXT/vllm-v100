@@ -189,6 +189,31 @@ def compute_topk_scores(
     )
 
 
+def concat_logprob_stashes(
+    parts: list[LogprobsTensors], cu_num_generated_tokens: list[int]
+) -> LogprobsTensors:
+    """Join the logprobs stashed per request for the requests committing
+    this step (DiffusionGemma, full-sequence diffusion).
+
+    Stashes can differ in width (DiffusionGemma: the widest logprobs request
+    in the batch at the step a request converged; full-sequence diffusion:
+    the request's own logprobs). Pad the narrow ones the way
+    compute_topk_scores pads a mixed batch: token id 0 at -inf, which the
+    output processor never reports.
+    """
+    width = max(p.logprob_token_ids.shape[1] for p in parts)
+
+    def pad(t: torch.Tensor, value: float) -> torch.Tensor:
+        return torch.nn.functional.pad(t, (0, width - t.shape[1]), value=value)
+
+    return LogprobsTensors(
+        logprob_token_ids=torch.cat([pad(p.logprob_token_ids, 0) for p in parts]),
+        logprobs=torch.cat([pad(p.logprobs, float("-inf")) for p in parts]),
+        selected_token_ranks=torch.cat([p.selected_token_ranks for p in parts]),
+        cu_num_generated_tokens=cu_num_generated_tokens,
+    )
+
+
 @triton.jit
 def _fill_logprob_token_ids_kernel(
     # [batch_size, 1 + num_cols]

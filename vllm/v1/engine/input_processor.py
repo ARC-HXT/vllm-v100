@@ -574,11 +574,8 @@ class InputProcessor:
             mask_token_id=model_config.hf_config.mask_token_id,
             generation_config=self.generation_config_fields,
             max_model_len=model_config.max_model_len,
-            max_position=getattr(
-                model_config.hf_text_config,
-                "max_position_embeddings",
-                model_config.max_model_len,
-            ),
+            # Set by FullSequenceDiffusionConfig.verify_and_update_config.
+            max_seq_len=model_config.hf_config.dlm_max_seq_len,
             max_num_scheduled_tokens=(
                 scheduler_config.max_num_scheduled_tokens
                 or scheduler_config.max_num_batched_tokens

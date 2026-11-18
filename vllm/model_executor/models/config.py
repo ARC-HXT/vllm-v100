@@ -529,6 +529,22 @@ class FullSequenceDiffusionConfig(VerifyAndUpdateConfig):
         if vllm_config.cache_config.enable_prefix_caching:
             logger.info("%s: disabling prefix caching (no KV cache).", name)
             vllm_config.cache_config.enable_prefix_caching = False
+        # Plan 2.8 middle 1. A request occupies P + G token slots in the
+        # scheduler (prompt + canvas) and G more for the output written on its
+        # last step, so it needs P + 2G <= max_model_len; the model itself
+        # runs P + G positions. With no KV cache, max_model_len only sizes the
+        # per-request token rows, so it is widened to hold the largest canvas
+        # (G < P + G <= dlm_max_seq_len) and admission bounds P + G by
+        # dlm_max_seq_len: the model's positions, or the configured
+        # max_model_len if smaller (vllm.utils.diffusion).
+        model_config = vllm_config.model_config
+        hf_config = model_config.hf_config
+        seq_len = getattr(hf_config, "dlm_max_seq_len", None)
+        if seq_len is None:  # the hook may see an already widened config
+            positions = getattr(hf_config, "max_position_embeddings", None)
+            seq_len = min(model_config.max_model_len, positions or 1 << 62)
+            hf_config.dlm_max_seq_len = seq_len
+        model_config.max_model_len = 2 * seq_len
 
 
 class LLaDAModelLMConfig(FullSequenceDiffusionConfig):
@@ -556,8 +572,33 @@ class LLaDAModelLMConfig(FullSequenceDiffusionConfig):
                 raise ValueError(
                     f"LLaDA: unsupported config {key}={getattr(hf_config, key)!r}"
                 )
-        hf_config.num_key_value_heads = hf_config.n_kv_heads or hf_config.n_heads
-        hf_config.intermediate_size = hf_config.mlp_hidden_size
+        # modeling_llada.py:412-415 rotates q / k in fp32 only when
+        # rope_full_precision (llada.py always does).
+        if not getattr(hf_config, "rope_full_precision", True):
+            raise ValueError(
+                "LLaDA: unsupported config rope_full_precision=False "
+                "(RoPE in the model dtype)"
+            )
+        # LLaDAConfig.effective_n_kv_heads (configuration_llada.py:366-384).
+        n_kv = getattr(hf_config, "n_kv_heads", None)
+        mqa = getattr(hf_config, "multi_query_attention", None)
+        if n_kv is None:
+            n_kv = 1 if mqa is True else hf_config.n_heads
+        elif mqa is not None and n_kv != (1 if mqa else hf_config.n_heads):
+            raise ValueError(
+                f"LLaDA: multi_query_attention={mqa!r} contradicts "
+                f"n_kv_heads={n_kv} (the official config refuses both)"
+            )
+        hf_config.num_key_value_heads = n_kv
+        # LLaDALlamaBlock (modeling_llada.py:530-532).
+        mlp = getattr(hf_config, "mlp_hidden_size", None)
+        if mlp is None:
+            mlp = getattr(hf_config, "mlp_ratio", 4) * hf_config.d_model
+        if not isinstance(mlp, int) or isinstance(mlp, bool) or mlp <= 0:
+            raise ValueError(f"LLaDA: unsupported config mlp_hidden_size={mlp!r}")
+        hf_config.intermediate_size = mlp
+        # clip_qkv is not read: the official model never reads it either
+        # (no use in configuration_llada.py / modeling_llada.py).
         hf_config.hidden_act = "silu"
         # LLaDAConfig does not define tie_word_embeddings, and transformers'
         # default is True; the checkpoint has a separate output head

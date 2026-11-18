@@ -391,3 +391,101 @@ def test_custom_policy_in_the_worker(llm):
     report({"test": "custom_policy", "counts": counts, "final_masks": final_masks})
     assert counts["remask"] > 0 and counts["rewrite"] > 0
     assert final_masks == 0
+
+
+# --------------------------------------------------------------------------
+# 5. Seeded randomness on the GPU (no model; plan section 3, GPU item 4).
+# --------------------------------------------------------------------------
+
+_CHI2_999_15 = 37.70  # chi-square, 15 degrees of freedom, p = 0.001
+
+
+def _chi2(counts, probs):
+    expected = probs * counts.sum()
+    return float(((counts - expected) ** 2 / expected).sum())
+
+
+def test_cpu_hash_port_equals_the_kernel():
+    # The CPU tests draw from the harness' torch port of the murmur3 hash;
+    # it must be the engine kernel's function value for value.
+    from tests.attpatt_v100.dlm_harness import cpu_hash_uniform
+    from vllm.v1.worker.gpu.dlm.random import hash_uniform_cuda
+
+    g = torch.Generator().manual_seed(0)
+    seeds = torch.randint(-(2**62), 2**62, (4096,), generator=g)
+    pos = torch.randint(0, 2**40, (4096,), generator=g)
+    for salt in (0, (1 << 28) + 1):
+        for fp64 in (False, True):
+            ref = cpu_hash_uniform(seeds, pos, salt, fp64)
+            got = hash_uniform_cuda(seeds.cuda(), pos.cuda(), salt, fp64).cpu()
+            assert torch.equal(got, ref), (salt, fp64)
+
+
+def _score_inputs(policy_name, logits, temperature, **cfg_kw):
+    from vllm.v1.worker.gpu.dlm.policy import DlmRequestConfig, DlmScoreInputs
+
+    n = logits.shape[0]
+    dev = logits.device
+    args = (
+        {"logits_eos_inf": False, "confidence_eos_eot_inf": False}
+        if policy_name.startswith("llada")
+        else {"eps": 1e-3, "alg_temp": None}
+    )
+    cfg = DlmRequestConfig(gen_length=1, steps=1, block_length=1,
+                           policy=policy_name, policy_args=args,
+                           temperature=temperature, **cfg_kw)  # fmt: skip
+    idx = torch.arange(n, device=dev)
+    zeros = torch.zeros(n, dtype=torch.int64, device=dev)
+    return DlmScoreInputs(
+        logits=logits,
+        hidden=None,
+        row_req=idx,
+        row_pos=zeros,
+        row_slot=idx,
+        row_token=zeros,
+        row_req_np=idx.cpu().numpy(),
+        step=zeros,
+        slots=idx,
+        seeds=idx * 7919 + 11,
+        temperature=torch.full((n,), temperature, device=dev),
+        configs=[cfg] * n,
+        steps_np=zeros.cpu().numpy(),
+        state={},
+        mask_id=0,
+    )
+
+
+@pytest.mark.parametrize(
+    "policy_name,temperature,top_p,top_k",
+    [
+        ("llada_low_confidence", 0.7, 1.0, 0),  # add_gumbel_noise
+        ("dream_maskgit_plus", 0.7, 1.0, 0),  # Categorical(probs)
+        ("dream_maskgit_plus", 0.7, 0.8, 5),  # after top_p then top_k
+    ],
+)
+def test_temperature_sampling_follows_the_official_distribution(
+    policy_name, temperature, top_p, top_k
+):
+    from tests.attpatt_v100 import dlm_official as official
+    from vllm.v1.worker.gpu.dlm.policy import get_unmask_policy_cls
+
+    n, vocab = 20000, 16
+    g = torch.Generator().manual_seed(1)
+    row = torch.randn(vocab, generator=g) * 1.5
+    logits = row.expand(n, vocab).contiguous().cuda()
+    policy = get_unmask_policy_cls(policy_name)()
+    x = _score_inputs(policy_name, logits, temperature, top_p=top_p, top_k=top_k)
+    x0 = policy.score(x)["x0"].cpu()
+    ref = row.double() / temperature
+    if top_p < 1:
+        ref = official.top_p_logits(ref[None], top_p)[0]
+    if top_k:
+        ref = official.top_k_logits(ref[None], top_k)[0]
+    probs = torch.softmax(ref, 0)
+    counts = torch.bincount(x0, minlength=vocab).double()
+    assert counts[probs == 0].sum() == 0
+    keep = probs > 0
+    stat = _chi2(counts[keep], probs[keep])
+    report({"test": "temperature_distribution", "policy": policy_name,
+            "top_p": top_p, "top_k": top_k, "chi2": stat})  # fmt: skip
+    assert stat < _CHI2_999_15

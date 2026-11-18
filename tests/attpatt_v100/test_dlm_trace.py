@@ -84,7 +84,7 @@ def test_trace_off_costs_nothing():
     sampler, _, _, outs = _single(_params())
     assert all(o.dlm_trace is None for o in outs)
     assert all(o.logprobs_tensors is None for o in outs)
-    assert sampler.lp_ids is None
+    assert not sampler.lp_stash
 
 
 def test_trace_rows_match_the_model_distribution():
@@ -197,9 +197,10 @@ def test_logprobs_in_a_batch_with_requests_without_them(cpu_logprobs):
     run.add("b", 1, PROMPT, _params(logprobs=0))
     outs = _run_steps(run, [{"a": s, "b": s} for s in range(STEPS)])
     lp = outs[-1].logprobs_tensors
-    assert lp.cu_num_generated_tokens == [0, G, 2 * G]
+    # Only b has rows; the scheduler reads them with slice_request.
+    assert lp.cu_num_generated_tokens == [0, 0, G]
     seq_b = run.sequence("b")[len(PROMPT) :]
-    assert lp.logprob_token_ids[G:, 0].tolist() == seq_b.tolist()
+    assert lp.tolists().slice_request(1, G)[0][:, 0].tolist() == seq_b.tolist()
 
 
 def test_accumulator_stacks_steps():
@@ -317,3 +318,50 @@ def test_async_output_splits_the_trace_per_request():
     assert split["a"]["x0"].tolist() == [0, 1]
     assert split["b"]["x0"].tolist() == [2, 3, 4]
     assert split["b"]["topk_ids"].shape == (3, 1)
+
+
+def _sampler_bytes(sampler) -> int:
+    """Bytes of the tensors the sampler itself holds (not the runner's)."""
+    runner_owned = {"sampling_states", "logprob_token_ids_state", "req_states"}
+    seen, total = set(), 0
+
+    def walk(value, depth=0):
+        nonlocal total
+        if isinstance(value, torch.Tensor):
+            key = (value.data_ptr(), value.nbytes)
+            if key not in seen:
+                seen.add(key)
+                total += value.nbytes
+        elif depth < 3 and isinstance(value, dict):
+            for v in value.values():
+                walk(v, depth + 1)
+        elif depth < 3 and isinstance(value, (list, tuple)):
+            for v in value:
+                walk(v, depth + 1)
+
+    for name, value in vars(sampler).items():
+        if name not in runner_owned and name != "model_state":
+            walk(value)
+    return total
+
+
+def test_logprob_stash_is_sized_by_the_requests(cpu_logprobs):
+    # The stash must not be the worst case max_num_reqs * max_model_len / 2
+    # rows (outside the memory profile): one request with logprobs=K holds
+    # about G * (1 + K) entries.
+    sampler = make_sampler("llada", max_num_reqs=64, max_model_len=8192)
+    model = ToyLM(sampler.vocab_size, seed=5)
+    run = Run(sampler, {"a": model, "b": model})
+    run.add("a", 0, PROMPT, _params())  # policy state allocated here
+    before = _sampler_bytes(sampler)
+    run.add("b", 1, PROMPT, _params(logprobs=5))
+    grown = _sampler_bytes(sampler) - before
+    assert grown <= 12 * G * (1 + 5) + 1024, grown
+    outs = _run_steps(run, [{"a": s, "b": s} for s in range(STEPS)])
+    lp = outs[-1].logprobs_tensors
+    assert lp.cu_num_generated_tokens == [0, 0, G]
+    assert (
+        lp.tolists().slice_request(1, G)[0][:, 0].tolist()
+        == run.sequence("b")[5:].tolist()
+    )
+    assert not sampler.lp_stash  # released with the last step

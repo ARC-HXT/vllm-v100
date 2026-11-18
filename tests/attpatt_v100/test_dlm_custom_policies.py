@@ -125,7 +125,9 @@ def reference(model, prompt, gen, steps, mask_id, shift, args, features):
         k = (int(masked.sum()) + left - 1) // left
         rank = conf
         if features:
-            rank = conf + args["feature_weight"] * torch.tanh(rows.float().mean(-1))
+            # Policies get the unshifted rows: canvas j <- row P + j.
+            feat = torch.tanh(hidden[P : P + gen].float().mean(-1))
+            rank = conf + args["feature_weight"] * feat
         order = torch.sort(
             torch.where(masked, rank, float("-inf")), descending=True, stable=True
         ).indices

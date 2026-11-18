@@ -12,15 +12,12 @@ Settings, reference data and helpers as test_dlm_gpu.py (``DLM_MODEL``).
 
 import copy
 import gc
-import os
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-
-from tests.attpatt_v100.test_dlm_gpu import (  # noqa: E402,F401
+from tests.attpatt_v100.test_dlm_gpu import (  # noqa: F401
     EDIT,
     GATE_ITEMS,
     MASK,
@@ -39,10 +36,14 @@ from tests.attpatt_v100.test_dlm_gpu import (  # noqa: E402,F401
 
 @pytest.fixture(scope="module")
 def llm():
-    engine = make_llm()
-    yield engine
-    del engine
-    gc.collect()
+    # In-process engine core for this module's engine only (module
+    # docstring); the variable is restored afterwards.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+        engine = make_llm()
+        yield engine
+        del engine
+        gc.collect()
 
 
 # --------------------------------------------------------------------------

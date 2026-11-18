@@ -45,7 +45,10 @@ from vllm.v1.worker.gpu.dlm.trace import (
     DlmTraceTensors,
     trace_row_stats,
 )
-from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
+from vllm.v1.worker.gpu.sample.logprob import (
+    compute_topk_scores,
+    concat_logprob_stashes,
+)
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.penalties import NO_PENALTIES_STATE
 
@@ -56,12 +59,6 @@ _CHUNK_BYTES = 1 << 30
 # Extra transient bytes per logit: trajectory (log-softmax + probs), logprobs.
 _TRACE_BYTES_PER_LOGIT = 8
 _LOGPROBS_BYTES_PER_LOGIT = 4
-
-
-def _h2d(array: np.ndarray, device: torch.device) -> torch.Tensor:
-    if device.type == "cpu":  # CPU tests
-        return torch.from_numpy(array)
-    return async_tensor_h2d(array, device=device)
 
 
 _DEFAULT_POLICY = {"llada": "llada_low_confidence", "dream": "dream_maskgit_plus"}
@@ -85,17 +82,22 @@ class FullSeqDiffusionSampler:
         self.logits_shift = int(getattr(model_state.model, "dlm_logits_shift", 0))
         self.device = model_state.device
         self.max_num_reqs = model_state.max_num_reqs
-        # P + 2G <= max_model_len (checked at admission), so G < max_len / 2.
+        # P + G <= dlm_max_seq_len = max_model_len / 2 (config hook and
+        # admission), so G < max_model_len / 2.
         self.max_canvas = max(1, model_state.max_model_len // 2)
         self.configs: list[DlmRequestConfig | None] = [None] * self.max_num_reqs
         self.failed = [False] * self.max_num_reqs
         self.policies: dict[str, UnmaskPolicy] = {}
         self.policy_states: dict[str, dict[str, torch.Tensor]] = {}
-        # Logprob stash [max_num_reqs * max_canvas, 1 + K], allocated on the
-        # first request that asks for logprobs and widened on demand.
-        self.lp_ids: torch.Tensor | None = None
-        self.lp_logp: torch.Tensor | None = None
-        self.lp_rank: torch.Tensor | None = None
+        # Per-slot temperature as the client set it: SamplingParams raises
+        # 0 < T < 0.01 for vLLM's sampler, sampling_states keeps that value.
+        self.temperature = torch.zeros(
+            self.max_num_reqs, dtype=torch.float32, device=self.device
+        )
+        # Logprob stash of each request that asks for logprobs: [G, 1 + K]
+        # (its own G and K), allocated at add_request, released when its
+        # last step hands it out.
+        self.lp_stash: dict[int, LogprobsTensors] = {}
 
     # ------------------------------------------------------------------
     # Request state
@@ -111,30 +113,14 @@ class FullSeqDiffusionSampler:
             )
         return policy
 
-    def _ensure_lp_stash(self, num_logprobs: int) -> None:
-        width = 1 + num_logprobs
-        if self.lp_ids is not None and self.lp_ids.shape[1] >= width:
-            return
-        rows = self.max_num_reqs * self.max_canvas
-        ids = torch.zeros(rows, width, dtype=torch.int32, device=self.device)
-        logp = torch.full(
-            (rows, width), float("-inf"), dtype=torch.float32, device=self.device
-        )
-        if self.lp_ids is not None:
-            old = self.lp_ids.shape[1]
-            ids[:, :old] = self.lp_ids
-            logp[:, :old] = self.lp_logp
-            rank = self.lp_rank
-        else:
-            rank = torch.zeros(rows, dtype=torch.int32, device=self.device)
-        self.lp_ids, self.lp_logp, self.lp_rank = ids, logp, rank
-
     def add_request(self, req_idx: int, sampling_params: Any) -> None:
         self.sampling_states.add_request(req_idx, sampling_params)
         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
         config = DlmRequestConfig.from_sampling_params(sampling_params)
         self.failed[req_idx] = False
+        self.lp_stash.pop(req_idx, None)
         if config is not None:
+            self.temperature[req_idx] = config.temperature
             config.prompt_len = (
                 int(self.req_states.prompt_len.np[req_idx]) - config.gen_length
             )
@@ -150,8 +136,18 @@ class FullSeqDiffusionSampler:
                     "Diffusion policy %r failed on this worker", config.policy
                 )
                 self.failed[req_idx] = True
-            if config.num_logprobs >= 0:
-                self._ensure_lp_stash(config.num_logprobs)
+            if config.num_logprobs >= 0 and not self.failed[req_idx]:
+                g, width = config.gen_length, 1 + config.num_logprobs
+                dev = self.device
+                self.lp_stash[req_idx] = LogprobsTensors(
+                    logprob_token_ids=torch.zeros(
+                        g, width, dtype=torch.int32, device=dev
+                    ),
+                    logprobs=torch.full(
+                        (g, width), float("-inf"), dtype=torch.float32, device=dev
+                    ),
+                    selected_token_ranks=torch.zeros(g, dtype=torch.int32, device=dev),
+                )
         self.configs[req_idx] = config
 
     def apply_staged_writes(self) -> None:
@@ -177,7 +173,7 @@ class FullSeqDiffusionSampler:
         steps = self.model_state.dlm_steps
         num_sampled = np.zeros(num_reqs, dtype=np.int32)
         groups: dict[str, list[tuple[int, int, int]]] = defaultdict(list)
-        lp_slots: list[int] = []  # slots of the requests finishing this step
+        finishing: dict[int, int] = {}  # batch index -> slot, last step
         want_logprobs = False
         for batch_idx in range(num_reqs):
             slot = int(input_batch.idx_mapping_np[batch_idx])
@@ -193,7 +189,7 @@ class FullSeqDiffusionSampler:
             groups[config.policy].append((batch_idx, slot, step))
             if step == config.steps - 1:
                 num_sampled[batch_idx] = config.gen_length
-                lp_slots.append(slot)
+                finishing[batch_idx] = slot
                 want_logprobs |= config.num_logprobs >= 0
 
         # Fresh per step: the async D2H copy of the previous step may still
@@ -219,39 +215,37 @@ class FullSeqDiffusionSampler:
 
         logprobs_tensors = None
         if want_logprobs:
-            logprobs_tensors = self._gather_logprobs(lp_slots, num_sampled)
+            logprobs_tensors = self._gather_logprobs(finishing, num_reqs)
         query_lens = np.diff(query_start_loc[: num_reqs + 1]).astype(np.int32)
         return SamplerOutput(
             sampled_token_ids=sampled,
             logprobs_tensors=logprobs_tensors,
             num_nans=None,
-            num_sampled=_h2d(num_sampled, self.device),
+            num_sampled=async_tensor_h2d(num_sampled, device=self.device),
             # Every query token is "rejected": num_computed_tokens stays 0.
-            num_rejected=_h2d(query_lens, self.device),
+            # Not DiffusionGemma's _compute_num_rejected: there a committing
+            # request keeps its accepted tokens (num_logits - num_sampled);
+            # here every step, the last included, re-runs the whole sequence,
+            # and the value is known on the host.
+            num_rejected=async_tensor_h2d(query_lens, device=self.device),
             dlm_trace=self._pack_trace(trace_parts) if trace_parts else None,
         )
 
     def _gather_logprobs(
-        self, slots: list[int], num_sampled: np.ndarray
+        self, finishing: dict[int, int], num_reqs: int
     ) -> LogprobsTensors:
-        """Stash rows of the finishing requests, in batch order (requests
-        without logprobs get rows the scheduler never reads)."""
-        assert self.lp_ids is not None
-        configs = [self.configs[s] for s in slots]
-        rows = np.concatenate(
-            [
-                s * self.max_canvas + np.arange(c.gen_length, dtype=np.int64)
-                for s, c in zip(slots, configs)
-            ]
-        )
-        index = _h2d(rows, self.device)
-        cu = np.concatenate(([0], np.cumsum(num_sampled))).tolist()
-        return LogprobsTensors(
-            logprob_token_ids=self.lp_ids.index_select(0, index),
-            logprobs=self.lp_logp.index_select(0, index),
-            selected_token_ranks=self.lp_rank.index_select(0, index),
-            cu_num_generated_tokens=cu,
-        )
+        """The stashes of the requests finishing this step, in batch order;
+        cu_num_generated_tokens[i] is request i's first row (requests
+        without logprobs have none)."""
+        parts: list[LogprobsTensors] = []
+        cu = [0]
+        for batch_idx in range(num_reqs):
+            slot = finishing.get(batch_idx)
+            stash = None if slot is None else self.lp_stash.pop(slot, None)
+            if stash is not None:
+                parts.append(stash)
+            cu.append(cu[-1] + (0 if stash is None else stash.logprobs.shape[0]))
+        return concat_logprob_stashes(parts, cu)
 
     @staticmethod
     def _pack_trace(
@@ -336,7 +330,8 @@ class FullSeqDiffusionSampler:
             - np.repeat(np.cumsum(counts) - counts, counts)
             + np.repeat(ranges[:, 0], counts)
         )
-        # Canvas position j reads hidden row P + j - shift of its request.
+        # Canvas position j reads its logits from hidden row P + j - shift
+        # of its request (Dream: shift 1); policies get row P + j itself.
         hidden_rows = (
             query_start_loc[batch_idx].astype(np.int64)[row_req]
             + prompt_len[row_req]
@@ -361,7 +356,7 @@ class FullSeqDiffusionSampler:
                 batch_idx,
             ]
         )
-        dev = _h2d(packed, device)
+        dev = async_tensor_h2d(packed, device=device)
         sizes = [num_rows * width] * 2 + [total] * 3 + [num_rows] * 8
         (
             flat_idx_t,
@@ -397,7 +392,7 @@ class FullSeqDiffusionSampler:
             buf.index_copy_(0, flat, value)
 
         seeds = self.sampling_states.seeds.gpu
-        temperature = self.sampling_states.temperature.gpu
+        temperature = self.temperature
         bytes_per_logit = policy.bytes_per_logit
         if trace_topk >= 0:
             bytes_per_logit += _TRACE_BYTES_PER_LOGIT
@@ -409,13 +404,21 @@ class FullSeqDiffusionSampler:
             rows = slice(start, start + chunk)
             hidden = hidden_states[hidden_rows_t[rows]]
             logits = compute_logits(hidden)
+            policy_hidden = None
+            if policy.needs_hidden_states:
+                # Unshifted final-norm rows (DlmScoreInputs.hidden).
+                policy_hidden = (
+                    hidden_states[hidden_rows_t[rows] + self.logits_shift]
+                    if self.logits_shift
+                    else hidden
+                )
             chunk_req = row_req_t[rows]
             flat = chunk_req * width + row_pos_t[rows]
             current = canvas.view(-1)[flat]
             out = policy.score(
                 DlmScoreInputs(
                     logits=logits,
-                    hidden=hidden if policy.needs_hidden_states else None,
+                    hidden=policy_hidden,
                     row_req=chunk_req,
                     row_pos=row_pos_t[rows],
                     row_slot=slots_t[chunk_req],
@@ -497,7 +500,7 @@ class FullSeqDiffusionSampler:
         last = steps_np == num_steps - 1
         if num_logprobs >= 0:
             self._stash_logprobs(
-                kept, written, new_canvas, valid_t, slots_t, num_steps_t, steps_t
+                kept, written, new_canvas, valid_t, slots, configs, num_steps_t, steps_t
             )
         if traced.any():
             self._trace_rows(
@@ -529,31 +532,32 @@ class FullSeqDiffusionSampler:
         written: torch.Tensor,
         new_canvas: torch.Tensor,
         valid: torch.Tensor,
-        slots: torch.Tensor,
+        slots: np.ndarray,
+        configs: list[DlmRequestConfig],
         num_steps: torch.Tensor,
         steps: torch.Tensor,
     ) -> None:
         """Keep this step's scores where a token was written; on the last
-        step also where the position is still masked."""
-        assert self.lp_ids is not None
-        num_rows, width = written.shape
+        step also where the position is still masked. The group's scores
+        are 1 + its widest K; each stash keeps its request's 1 + K."""
+        width = written.shape[1]
         last = (steps == num_steps - 1).unsqueeze(1)
         take = (written | (last & (new_canvas == self.mask_id))) & valid
-        dest = (
-            slots.unsqueeze(1) * self.max_canvas
-            + torch.arange(width, device=written.device)
-        ).view(-1)
-        take = take.view(-1, 1)
-        k = kept["lp_ids"].shape[1]
-        for stash, name in (
-            (self.lp_ids, "lp_ids"),
-            (self.lp_logp, "lp_logp"),
-        ):
-            view = stash[:, :k]
-            new = torch.where(take, kept[name], view[dest])
-            view[dest] = new
-        rank = self.lp_rank
-        rank[dest] = torch.where(take.view(-1), kept["lp_rank"], rank[dest])
+        for r, (slot, config) in enumerate(zip(slots, configs)):
+            stash = self.lp_stash.get(int(slot))
+            if stash is None:
+                continue
+            g = config.gen_length
+            k = stash.logprob_token_ids.shape[1]
+            rows = slice(r * width, r * width + g)
+            t = take[r, :g]
+            for buf, name in (
+                (stash.logprob_token_ids, "lp_ids"),
+                (stash.logprobs, "lp_logp"),
+            ):
+                buf.copy_(torch.where(t.unsqueeze(1), kept[name][rows, :k], buf))
+            rank = stash.selected_token_ranks
+            rank.copy_(torch.where(t, kept["lp_rank"][rows], rank))
 
     def _trace_rows(
         self,
@@ -580,7 +584,7 @@ class FullSeqDiffusionSampler:
         index = np.concatenate(
             [r * width + np.arange(g, dtype=np.int64) for r, g in zip(reqs, lens)]
         )
-        index_t = _h2d(index, self.device)
+        index_t = async_tensor_h2d(index, device=self.device)
         fields = {
             name: kept[name].index_select(0, index_t)
             for name in ("token_logp", "entropy", "margin", "topk_ids", "topk_logp")

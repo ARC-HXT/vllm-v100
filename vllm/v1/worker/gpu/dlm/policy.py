@@ -75,6 +75,9 @@ class DlmRequestConfig:
         extra = getattr(params, "extra_args", None) or {}
         if POLICY_KEY not in extra or STEPS_KEY not in extra:
             return None
+        from vllm.utils.diffusion import requested_sampling
+
+        temperature, top_p, top_k, _ = requested_sampling(params)
         return cls(
             trace_topk=extra[TRACE_TOPK_KEY] if extra.get(TRACE_KEY) else -1,
             num_logprobs=-1 if params.logprobs is None else params.logprobs,
@@ -83,9 +86,9 @@ class DlmRequestConfig:
             block_length=extra.get(BLOCK_KEY) or params.max_tokens,
             policy=extra[POLICY_KEY],
             policy_args=dict(extra.get(POLICY_ARGS_KEY) or {}),
-            temperature=params.temperature,
-            top_p=params.top_p,
-            top_k=params.top_k if params.top_k and params.top_k > 0 else 0,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k if top_k > 0 else 0,
         )
 
 
@@ -276,13 +279,6 @@ def hash_uniform(
 ) -> torch.Tensor:
     """Uniform(0, 1) per row from (seed, pos, salt), via the murmur3 hash of
     ``sample/gumbel.py`` (the noise source of vLLM's seeded sampling)."""
-    if seeds.is_cuda:
-        from vllm.v1.worker.gpu.dlm.random import hash_uniform_cuda
+    from vllm.v1.worker.gpu.dlm.random import hash_uniform_cuda
 
-        return hash_uniform_cuda(seeds, pos, salt, fp64)
-    # CPU (tests only): a seeded generator per call keeps it deterministic.
-    gen = torch.Generator().manual_seed(
-        int(torch.sum(seeds * 1000003 + pos).item()) ^ salt
-    )
-    dtype = torch.float64 if fp64 else torch.float32
-    return torch.rand(seeds.shape, generator=gen, dtype=dtype)
+    return hash_uniform_cuda(seeds, pos, salt, fp64)
