@@ -2427,6 +2427,10 @@ class Scheduler(SchedulerInterface):
                 self._free_encoder_inputs(request)
 
             stopped = False
+            # Read before the diffusion last-step check below can set the
+            # status to FINISHED_ERROR: the stop bookkeeping at the end of
+            # this loop removes a RUNNING request from self.running.
+            status_before_stop = request.status
             if request.dlm_total_steps and not output_is_stale:
                 dlm_trace = model_runner_output.dlm_trace
                 if dlm_trace is not None and req_id in dlm_trace:
@@ -2458,7 +2462,6 @@ class Scheduler(SchedulerInterface):
             kv_transfer_params = None
             ec_transfer_params = None
             prefill_stats = None
-            status_before_stop = request.status
 
             # Check for stop and update request status.
             if new_token_ids:

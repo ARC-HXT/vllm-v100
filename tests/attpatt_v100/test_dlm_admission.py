@@ -78,7 +78,7 @@ def test_dream_defaults_come_from_generation_config():
             "diffusion_trace_topk must be",
         ),
         ({"stop": ["x"]}, "stop"),
-        ({"max_tokens": 2048}, "max_model_len"),
+        ({"max_tokens": 4096}, "exceeds 4096, the model's positions"),
     ],
 )
 def test_llada_admission_rejects(kw, needle):
@@ -98,8 +98,8 @@ def test_budget_and_dream_block_checks():
             prompt_token_ids=PROMPT,
             mask_token_id=LLADA_MASK,
             generation_config={},
-            max_model_len=4096,
-            max_position=4096,
+            max_model_len=8192,
+            max_seq_len=4096,
             max_num_scheduled_tokens=200,
         )
     assert "semi-AR" in _error(
@@ -315,3 +315,171 @@ def test_default_rope_keeps_the_model_dtype_cache(vllm_config_ctx):
     assert rope.cos_sin_cache.dtype == torch.float16
     with pytest.raises(ValueError, match="fp32_compute"):
         get_rope(64, max_position=128, dtype=torch.float16, fp32_compute=True)
+
+
+# --------------------------------------------------------------------------
+# Sampling options: the official semantics, never silently changed.
+# --------------------------------------------------------------------------
+
+
+def _config(params):
+    from vllm.v1.worker.gpu.dlm.policy import DlmRequestConfig
+
+    return DlmRequestConfig.from_sampling_params(params)
+
+
+@pytest.mark.parametrize("alg", ["maskgit_plus", "topk_margin", "entropy"])
+def test_dream_greedy_keeps_top_p_and_top_k(alg):
+    # Official sample_tokens applies top_p / top_k at temperature 0 as well
+    # and renormalizes the confidence (generation_utils.py:58-77);
+    # SamplingParams' greedy normalization must not drop them.
+    p = normalized_params(
+        "dream",
+        PROMPT,
+        64,
+        temperature=0.0,
+        top_p=0.9,
+        top_k=50,
+        extra_args={"diffusion_policy": f"dream_{alg}"},
+    )
+    c = _config(p)
+    assert (c.temperature, c.top_p, c.top_k) == (0.0, 0.9, 50)
+
+
+@pytest.mark.parametrize("family", ["llada", "dream"])
+def test_small_temperature_is_not_raised(family):
+    # SamplingParams raises 0 < T < 0.01 to 0.01; the official code divides
+    # by the user's T (LLaDA add_gumbel_noise, Dream sample_tokens).
+    c = _config(normalized_params(family, PROMPT, 128, temperature=0.005))
+    assert c.temperature == 0.005
+
+
+def test_autoregressive_params_are_unchanged():
+    from vllm.sampling_params import SamplingParams
+
+    p = SamplingParams(temperature=0.0, top_p=0.9, top_k=50)
+    assert (p.temperature, p.top_p, p.top_k) == (0.0, 1.0, 0)
+    assert SamplingParams(temperature=0.005).temperature == 0.01
+
+
+@pytest.mark.parametrize(
+    "kw", [{"top_p": 0.9}, {"top_k": 5}, {"temperature": 0.5, "top_p": 0.9}]
+)
+def test_llada_rejects_top_p_and_top_k(kw):
+    # LLaDA's generate() has no top_p / top_k (generate.py:96-99).
+    assert "top_p / top_k" in _error(**kw)
+
+
+def test_llada_full_position_range_is_admitted():
+    # Plan 2.8 middle 1: the config hook widens max_model_len by the largest
+    # canvas, so every request the official code can run (P + G <= its 4096
+    # positions) fits, although prompt, canvas and output all occupy the
+    # request's token slots (P + 2G).
+    from vllm.model_executor.models.config import LLaDAModelLMConfig
+    from vllm.sampling_params import SamplingParams
+    from vllm.utils.diffusion import normalize_full_sequence_diffusion_params
+
+    hf = _llada_hf_config()
+    model_config = SimpleNamespace(
+        hf_config=hf,
+        override_generation_config={},
+        max_model_len=4096,  # resolved from the 4096 positions
+        architecture="LLaDAModelLM",
+        logprobs_mode="raw_logprobs",
+    )
+    LLaDAModelLMConfig.verify_and_update_model_config(model_config)
+    vllm_config = SimpleNamespace(
+        model_config=model_config,
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            enable_batch_sharded_sampling=False,
+        ),
+        diffusion_config=None,
+        speculative_config=None,
+        lora_config=None,
+        use_v2_model_runner=True,
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+    )
+    LLaDAModelLMConfig.verify_and_update_config(vllm_config)
+    prompt = list(range(1, 1025))
+    params = SamplingParams(
+        max_tokens=4096 - len(prompt),
+        extra_args={"diffusion_block_length": 4096 - len(prompt)},
+    )
+    normalize_full_sequence_diffusion_params(
+        params,
+        family="llada",
+        prompt_token_ids=prompt,
+        mask_token_id=LLADA_MASK,
+        generation_config={},
+        max_model_len=model_config.max_model_len,
+        max_seq_len=hf.dlm_max_seq_len,
+        max_num_scheduled_tokens=4096,
+    )
+    assert model_config.max_model_len >= 4096 + 3072
+
+
+def test_batch_gpu_module_leaves_the_environment_alone(monkeypatch):
+    # Collected with the rest of the directory, the GPU batch test must not
+    # switch other tests' engines to the in-process engine core.
+    import importlib
+    import os
+    import sys
+
+    key = "VLLM_ENABLE_V1_MULTIPROCESSING"
+    for value in (None, "1"):
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
+        monkeypatch.delitem(sys.modules, "tests.attpatt_v100.test_dlm_batch_gpu",
+                            raising=False)  # fmt: skip
+        importlib.import_module("tests.attpatt_v100.test_dlm_batch_gpu")
+        assert os.environ.get(key) == value
+
+
+# --------------------------------------------------------------------------
+# LLaDA config fields the conversion must honour or refuse.
+# --------------------------------------------------------------------------
+
+
+def _hook(**fields):
+    from vllm.model_executor.models.config import LLaDAModelLMConfig
+
+    hf = _llada_hf_config()
+    for key, value in fields.items():
+        setattr(hf, key, value)
+    LLaDAModelLMConfig.verify_and_update_model_config(
+        SimpleNamespace(hf_config=hf, override_generation_config={})
+    )
+    return hf
+
+
+@pytest.mark.parametrize(
+    "fields,needle",
+    [
+        ({"rope_full_precision": False}, "rope_full_precision"),
+        ({"multi_query_attention": True}, "multi_query_attention"),  # 32 kv heads
+        ({"mlp_hidden_size": "12288"}, "mlp_hidden_size"),
+    ],
+)
+def test_llada_config_hook_refuses_unsupported_fields(fields, needle):
+    with pytest.raises(ValueError, match=needle):
+        _hook(**fields)
+
+
+def test_llada_config_hook_ignores_clip_qkv_like_the_official_code():
+    # configuration_llada.py / modeling_llada.py never read clip_qkv.
+    hf = _hook(clip_qkv=8.0)
+    assert hf.num_key_value_heads == hf.n_kv_heads
+
+
+def test_llada_config_hook_follows_the_official_defaults():
+    # configuration_llada.py effective_n_kv_heads and LLaDALlamaBlock's
+    # hidden size (modeling_llada.py:531).
+    hf = _hook(n_kv_heads=None, multi_query_attention=True, mlp_hidden_size=None)
+    assert hf.num_key_value_heads == 1
+    assert hf.intermediate_size == hf.mlp_ratio * hf.d_model
+    hf = _hook(n_kv_heads=None, multi_query_attention=None)
+    assert hf.num_key_value_heads == hf.n_heads

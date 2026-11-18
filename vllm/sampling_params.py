@@ -402,6 +402,12 @@ class SamplingParams(
     _eos_token_id: int | None = None
     _all_stop_token_ids: set[int] = msgspec.field(default_factory=set)
     _watermarking_skipped: bool = False
+    # (temperature, top_p, top_k, min_p) as given, kept only when
+    # __post_init__ changes them for vLLM's sampler (a small temperature is
+    # raised to _MAX_TEMP; greedy sampling drops top_p / top_k / min_p).
+    # Full-sequence diffusion sampling follows the official code with the
+    # given values (vllm.utils.diffusion.requested_sampling).
+    _requested_sampling: tuple[float, float, int, float] | None = None
 
     # Fields used to construct logits processors
     structured_outputs: StructuredOutputsParams | None = None
@@ -557,6 +563,7 @@ class SamplingParams(
         )
 
     def __post_init__(self) -> None:
+        requested = (self.temperature, self.top_p, self.top_k, self.min_p)
         if 0 < self.temperature < _MAX_TEMP:
             logger.warning(
                 "temperature %s is less than %s, which may cause numerical "
@@ -618,6 +625,19 @@ class SamplingParams(
             self.top_k = 0
             self.min_p = 0.0
             self._verify_greedy_sampling()
+        if self._requested_sampling is None and requested != (
+            self.temperature,
+            self.top_p,
+            self.top_k,
+            self.min_p,
+        ):
+            t, top_p, top_k, min_p = requested
+            self._requested_sampling = (
+                float(t),
+                float(top_p),
+                int(top_k),
+                float(min_p),
+            )
 
         # eos_token_id is added to this by the engine
         self._all_stop_token_ids.update(self.stop_token_ids)

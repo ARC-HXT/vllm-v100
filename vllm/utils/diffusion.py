@@ -107,6 +107,14 @@ def validate_diffusion_sampling_params(
         )
 
 
+def requested_sampling(params: "SamplingParams") -> tuple[float, float, int, float]:
+    """(temperature, top_p, top_k, min_p) as the client set them: the values
+    before SamplingParams.__post_init__ adapted them to vLLM's sampler."""
+    if params._requested_sampling is not None:
+        return params._requested_sampling
+    return params.temperature, params.top_p, params.top_k, params.min_p
+
+
 def _check(valid: bool, message: str, parameter: str = "extra_args") -> None:
     if not valid:
         raise VLLMValidationError(message, parameter=parameter)
@@ -124,7 +132,7 @@ def normalize_full_sequence_diffusion_params(
     mask_token_id: int,
     generation_config: dict,
     max_model_len: int,
-    max_position: int,
+    max_seq_len: int,
     max_num_scheduled_tokens: int,
 ) -> None:
     """Validate a LLaDA / Dream request and write its normalized diffusion
@@ -133,12 +141,17 @@ def normalize_full_sequence_diffusion_params(
 
     Standard fields carry the official parameters of the same meaning
     (``max_tokens`` = gen_length / max_new_tokens, ``temperature``, ``top_p``,
-    ``top_k``, ``seed``); ``extra_args`` carries the rest:
+    ``top_k``, ``seed``; the values the client set, see
+    ``requested_sampling``); ``extra_args`` carries the rest:
     ``diffusion_max_steps`` (steps), ``diffusion_block_length`` (LLaDA
     block_length), ``diffusion_policy`` (remasking / alg) and
     ``diffusion_policy_args`` (e.g. Dream eps / alg_temp). Defaults are the
     official ones: LLaDA generate() signature (generate.py:96-99), Dream
     generation_config.json.
+
+    ``max_seq_len`` bounds P + G: the model's positions, or the configured
+    max_model_len if smaller (``FullSequenceDiffusionConfig``, which then
+    widens ``max_model_len`` itself to hold the G output tokens as well).
     """
     from vllm.v1.worker.gpu.dlm.builtin_policies import DreamPolicy
     from vllm.v1.worker.gpu.dlm.policy import (
@@ -156,6 +169,7 @@ def normalize_full_sequence_diffusion_params(
         TRACE_TOPK_KEY,
     )
 
+    temperature, top_p, top_k, min_p = requested_sampling(params)
     gen_length = params.max_tokens
     _check(
         _positive_int(gen_length),
@@ -169,7 +183,7 @@ def normalize_full_sequence_diffusion_params(
         "logprobs=-1": params.logprobs == -1,
         "prompt_logprobs": params.prompt_logprobs is not None,
         "min_tokens": params.min_tokens,
-        "min_p": params.min_p,
+        "min_p": min_p,
         "logit_bias": params.logit_bias,
         "bad_words": params.bad_words,
         "allowed_token_ids": params.allowed_token_ids,
@@ -192,16 +206,16 @@ def normalize_full_sequence_diffusion_params(
         "prompt",
     )
     _check(
-        prompt_len + gen_length <= max_position,
-        f"prompt ({prompt_len}) + max_tokens ({gen_length}) exceeds the "
-        f"model's {max_position} positions.",
+        prompt_len + gen_length <= max_seq_len,
+        f"prompt ({prompt_len}) + max_tokens ({gen_length}) exceeds "
+        f"{max_seq_len}, the model's positions or max_model_len if smaller.",
         "max_tokens",
     )
     _check(
         prompt_len + 2 * gen_length <= max_model_len,
         f"prompt ({prompt_len}) + 2 * max_tokens ({gen_length}) exceeds "
-        f"max_model_len ({max_model_len}); the canvas and the output both "
-        "occupy the request's token slots.",
+        f"the request's token slots ({max_model_len}); the canvas and the "
+        "output both occupy them.",
         "max_tokens",
     )
     _check(
@@ -231,7 +245,14 @@ def normalize_full_sequence_diffusion_params(
         f"{TRACE_TOPK_KEY} needs {TRACE_KEY}=True.",
     )
 
+    top_k_on = top_k not in (0, -1)
     if family == "llada":
+        # generate() has no top_p / top_k (generate.py:96-99).
+        _check(
+            top_p == 1.0 and not top_k_on,
+            "LLaDA does not support top_p / top_k (its generate() has neither).",
+            "sampling_params",
+        )
         default_policy = "llada_low_confidence"
         default_steps = 128
         default_block = 128
@@ -275,9 +296,9 @@ def normalize_full_sequence_diffusion_params(
         block_length=block,
         policy=policy_name,
         policy_args=policy_args,
-        temperature=params.temperature,
-        top_p=params.top_p,
-        top_k=params.top_k,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k if top_k_on else 0,
     )
     try:
         policy_cls().validate(policy_args, config)

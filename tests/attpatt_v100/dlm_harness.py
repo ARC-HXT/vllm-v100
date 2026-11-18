@@ -14,6 +14,80 @@ import torch
 LLADA_VOCAB, LLADA_MASK = 126464, 126336
 DREAM_VOCAB, DREAM_MASK = 152064, 151666
 
+# --------------------------------------------------------------------------
+# Seeded uniforms on the CPU. The engine's hash_uniform runs a Triton kernel
+# (dlm/random.py); the CPU tests use this torch port of the same murmur3 mix
+# (sample/gumbel.py murmur3_hash32): one value per element from (seed, pos,
+# salt) only, never from the rest of the batch.
+# --------------------------------------------------------------------------
+_M32 = 0xFFFFFFFF
+
+
+def _rotl32(v, s):
+    return ((v << s) | (v >> (32 - s))) & _M32
+
+
+def _mix32(h, k):
+    k = (k * 0xCC9E2D51) & _M32
+    k = _rotl32(k, 15)
+    k = (k * 0x1B873593) & _M32
+    h = h ^ k
+    h = _rotl32(h, 13)
+    return (h * 5 + 0xE6546B64) & _M32
+
+
+def _fmix32(h):
+    h = h ^ (h >> 16)
+    h = (h * 0x85EBCA6B) & _M32
+    h = h ^ (h >> 13)
+    h = (h * 0xC2B2AE35) & _M32
+    return h ^ (h >> 16)
+
+
+def _hash32(seeds, pos, salt, domain=0):
+    h = torch.full_like(seeds, domain)
+    h = _mix32(h, seeds & _M32)
+    h = _mix32(h, (seeds >> 32) & _M32)
+    h = _mix32(h, pos & _M32)
+    h = _mix32(h, torch.full_like(h, salt & _M32))
+    return _fmix32(h ^ 16)
+
+
+def cpu_hash_uniform(seeds, pos, salt, fp64=False):
+    """murmur3_uniform32 / murmur3_uniform64 of sample/gumbel.py."""
+    seeds = seeds.to(torch.int64)
+    pos = pos.to(torch.int64)
+    lo = _hash32(seeds, pos, salt)
+    if not fp64:
+        # (random32 + 0.5) * 2**-32, rounded once to fp32.
+        return ((lo.to(torch.float64) + 0.5) * 2.0**-32).to(torch.float32)
+    hi = _hash32(seeds, pos, salt, domain=0x9E3779B9)
+    random53 = ((hi << 21) | (lo >> 11)).to(torch.float64)
+    u = (random53 + 0.5) * 2.0**-53
+    return torch.where(u == 1.0, u - 2.0**-53, u)
+
+
+def _install_cpu_stubs():
+    from vllm.utils import torch_utils
+    from vllm.v1.worker.gpu.dlm import builtin_policies, policy
+
+    # No pinned staging without a GPU: async_tensor_h2d to the CPU then
+    # returns the host tensor itself.
+    if not torch.cuda.is_available():
+        torch_utils.PIN_MEMORY = False
+    engine_hash = policy.hash_uniform
+
+    def hash_uniform(seeds, pos, salt, fp64=False):
+        if seeds.is_cuda:
+            return engine_hash(seeds, pos, salt, fp64)
+        return cpu_hash_uniform(seeds, pos, salt, fp64)
+
+    policy.hash_uniform = hash_uniform
+    builtin_policies.hash_uniform = hash_uniform
+
+
+_install_cpu_stubs()
+
 
 class ToyLM:
     """logits(x) = tanh(E[x] + P[pos] + mean over the sequence) @ O, fp32."""
@@ -30,10 +104,16 @@ class ToyLM:
         self.seen: list[torch.Tensor] = []
         self.device = torch.device("cpu")
 
-    def logits(self, x: torch.Tensor) -> torch.Tensor:
+    def hidden(self, x: torch.Tensor) -> torch.Tensor:
+        """The "final-norm hidden states" [L, dim] of the sequence."""
         h = self.emb[x] + self.pos[: x.shape[0]]
-        h = torch.tanh(h + h.mean(0, keepdim=True))
+        return torch.tanh(h + h.mean(0, keepdim=True))
+
+    def head(self, h: torch.Tensor) -> torch.Tensor:
         return h @ self.out + self.bias
+
+    def logits(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(self.hidden(x))
 
     # Official LLaDA calls model(x, attention_mask=...).logits; official
     # Dream calls self(x, attention_mask, tok_idx).logits. Batch of one.
@@ -117,8 +197,8 @@ def normalized_params(family: str, prompt: list[int], max_tokens: int, **kw):
         prompt_token_ids=prompt,
         mask_token_id=mask,
         generation_config=generation_config,
-        max_model_len=4096,
-        max_position=4096,
+        max_model_len=8192,
+        max_seq_len=4096,
         max_num_scheduled_tokens=8192,
     )
     return params
@@ -127,9 +207,10 @@ def normalized_params(family: str, prompt: list[int], max_tokens: int, **kw):
 class Run:
     """Drive one engine-like run of several requests through the sampler."""
 
-    def __init__(self, sampler, models: dict[str, ToyLM]):
+    def __init__(self, sampler, models: dict[str, ToyLM], hidden_states=False):
         self.sampler = sampler
         self.models = models
+        self.hidden_states = hidden_states
         self.reqs: dict[str, tuple[int, int, int, int]] = {}  # slot, P, G, steps
         self.history: dict[str, list[torch.Tensor]] = {}
 
@@ -149,13 +230,22 @@ class Run:
         return self.sampler.req_states.all_token_ids.gpu[slot, : p + g].long().clone()
 
     def step(self, req_steps: dict[str, int]):
-        """One engine step over the given requests (req_id -> step index)."""
+        """One engine step over the given requests (req_id -> step index).
+        Each request's logits stand in for hidden states and compute_logits
+        is the identity; with hidden_states=True (one shared model) the
+        sampler gets the model's hidden states and its head instead."""
         req_ids = list(req_steps)
+        shared = {id(self.models[r]) for r in req_ids}
+        model = None
+        if self.hidden_states:
+            assert len(shared) == 1, "hidden_states needs one shared model"
+            model = self.models[req_ids[0]]
         hidden, qsl = [], [0]
         for req_id in req_ids:
             x = self.sequence(req_id)
             self.history[req_id].append(x)
-            hidden.append(self.models[req_id].logits(x))
+            m = self.models[req_id]
+            hidden.append(m.hidden(x) if model is not None else m.logits(x))
             qsl.append(qsl[-1] + x.shape[0])
         batch = SimpleNamespace(
             num_reqs=len(req_ids),
@@ -164,8 +254,9 @@ class Run:
             query_start_loc_np=np.array(qsl, dtype=np.int32),
         )
         self.sampler.model_state.dlm_steps = dict(req_steps)
+        compute_logits = model.head if model is not None else (lambda h: h.clone())
         return self.sampler.sample_hidden_states(
-            torch.cat(hidden), batch, lambda h: h.clone()
+            torch.cat(hidden), batch, compute_logits
         )
 
     def run_all(self):

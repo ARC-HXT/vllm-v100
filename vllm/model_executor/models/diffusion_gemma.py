@@ -65,6 +65,9 @@ from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
+from vllm.v1.worker.gpu.sample.logprob import (
+    concat_logprob_stashes as _concat_logprob_stashes,
+)
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.penalties import NO_PENALTIES_STATE, use_penalty
 from vllm.v1.worker.gpu.states import RequestState
@@ -363,29 +366,6 @@ def _compute_num_rejected(
     num_rejected = num_logits - num_sampled
     is_denoise = (num_logits > 0) & (num_sampled == 0)
     return torch.where(is_denoise, query_lens, num_rejected)
-
-
-def _concat_logprob_stashes(
-    parts: list[LogprobsTensors], cu_num_generated_tokens: list[int]
-) -> LogprobsTensors:
-    """Join the logprobs stashed for the requests committing this step.
-
-    Each stash is as wide as the widest logprobs request in the batch at the
-    step that request converged, so stashes from different steps can differ
-    in width. Pad the narrow ones the way compute_topk_scores pads a mixed
-    batch: token id 0 at -inf, which the output processor never reports.
-    """
-    width = max(p.logprob_token_ids.shape[1] for p in parts)
-
-    def pad(t: torch.Tensor, value: float) -> torch.Tensor:
-        return F.pad(t, (0, width - t.shape[1]), value=value)
-
-    return LogprobsTensors(
-        logprob_token_ids=torch.cat([pad(p.logprob_token_ids, 0) for p in parts]),
-        logprobs=torch.cat([pad(p.logprobs, float("-inf")) for p in parts]),
-        selected_token_ranks=torch.cat([p.selected_token_ranks for p in parts]),
-        cu_num_generated_tokens=cu_num_generated_tokens,
-    )
 
 
 _MASKED_LOGIT = -1e20

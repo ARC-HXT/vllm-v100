@@ -63,12 +63,6 @@ def _row_flags(x: DlmScoreInputs, values: list[Any]) -> np.ndarray:
     return np.asarray(values)[x.row_req_np]
 
 
-def _to_device(a: np.ndarray, like: torch.Tensor) -> torch.Tensor:
-    if like.device.type == "cpu":  # CPU tests
-        return torch.from_numpy(a)
-    return async_tensor_h2d(a, device=like.device)
-
-
 # --------------------------------------------------------------------------
 # LLaDA
 # --------------------------------------------------------------------------
@@ -119,7 +113,7 @@ class LLaDAPolicy(UnmaskPolicy):
             logits = logits.clone()
         if any(eos_inf):
             # generate.py:173-174
-            rows = _to_device(_row_flags(x, eos_inf), logits)
+            rows = async_tensor_h2d(_row_flags(x, eos_inf), device=logits.device)
             col = logits[:, LLADA_EOS_ID]
             logits[:, LLADA_EOS_ID] = torch.where(rows, float("-inf"), col)
 
@@ -140,7 +134,7 @@ class LLaDAPolicy(UnmaskPolicy):
                 is_drafting=False,
                 use_fp64=True,
             )
-            row_greedy = _to_device(_row_flags(x, greedy), logits)
+            row_greedy = async_tensor_h2d(_row_flags(x, greedy), device=logits.device)
             x0 = torch.where(row_greedy, x0, noisy)
 
         if any(conf_eos):
@@ -148,9 +142,10 @@ class LLaDAPolicy(UnmaskPolicy):
             # logits[:, :, 126348] = -inf`, after x0. With T == 0,
             # add_gumbel_noise returns `logits` itself (:14-15), so both ids
             # leave the softmax; with T > 0 only 126348 does.
-            rows = _to_device(_row_flags(x, conf_eos), logits)
-            rows_greedy = _to_device(
-                _row_flags(x, [a and g for a, g in zip(conf_eos, greedy)]), logits
+            rows = async_tensor_h2d(_row_flags(x, conf_eos), device=logits.device)
+            rows_greedy = async_tensor_h2d(
+                _row_flags(x, [a and g for a, g in zip(conf_eos, greedy)]),
+                device=logits.device,
             )
             logits[:, LLADA_EOT_ID] = torch.where(
                 rows, float("-inf"), logits[:, LLADA_EOT_ID]
@@ -269,20 +264,21 @@ class DreamPolicy(UnmaskPolicy):
                 x.temperature[x.row_slot] > 0, x.temperature[x.row_slot], 1.0
             )
             logits = logits / temp.unsqueeze(1)
-        # vLLM normalizes top_p / top_k away for greedy requests, so at T == 0
-        # they are off (official would still renormalize the confidence).
+        # top_p / top_k apply at T == 0 too: they renormalize the confidence
+        # (the configs carry the client's values, requested_sampling).
         if any(c.top_p < 1.0 for c in cfgs):
-            top_p = _to_device(
-                _row_flags(x, [c.top_p for c in cfgs]).astype(np.float32), logits
+            top_p = async_tensor_h2d(
+                _row_flags(x, [c.top_p for c in cfgs]).astype(np.float32),
+                device=logits.device,
             )
             logits = _top_p_logits(logits, top_p)
         if any(c.top_k > 0 for c in cfgs):
             vocab = logits.shape[-1]
-            top_k = _to_device(
+            top_k = async_tensor_h2d(
                 _row_flags(
                     x, [min(c.top_k, vocab) if c.top_k > 0 else vocab for c in cfgs]
                 ).astype(np.int64),
-                logits,
+                device=logits.device,
             )
             logits = _top_k_logits(logits, top_k)
         probs = torch.softmax(logits, dim=-1)
@@ -301,7 +297,9 @@ class DreamPolicy(UnmaskPolicy):
                 apply_temperature=False,
                 is_drafting=False,
             )
-            row_sampled = _to_device(_row_flags(x, [t > 0 for t in temps]), logits)
+            row_sampled = async_tensor_h2d(
+                _row_flags(x, [t > 0 for t in temps]), device=logits.device
+            )
             x0 = torch.where(row_sampled, sampled, x0)
             confidence = torch.where(
                 row_sampled, probs.gather(-1, x0.unsqueeze(-1)).squeeze(-1), confidence
@@ -352,8 +350,8 @@ class DreamPolicy(UnmaskPolicy):
                     fp64=True,
                 )
                 gumbel = -torch.log(-torch.log(u)).to(torch.float32)
-                alg_temp = _to_device(
-                    np.asarray(alg_temps, dtype=np.float32), confidence
+                alg_temp = async_tensor_h2d(
+                    np.asarray(alg_temps, dtype=np.float32), device=confidence.device
                 )
                 use = (alg_temp > 0).unsqueeze(1)
                 keyed = (

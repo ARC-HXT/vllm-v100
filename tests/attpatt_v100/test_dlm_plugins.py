@@ -247,17 +247,58 @@ def test_policy_failing_on_the_worker_returns_no_tokens(registry):
     assert out["ok"].shape == (8,)
 
 
-def test_logits_processor_loaders_share_the_fqcn_loader():
-    """One FQCN implementation (vllm.utils.import_utils) for logits
-    processors (V1 and V2) and diffusion policies."""
-    import inspect
+class _Nest:
+    """Nested qualnames (``module:Outer.Inner``) resolve through getattr."""
 
+    class LeftToRight(LeftToRight):
+        name = "test_nested_left_to_right"
+
+
+def _error(fn, *args):
+    with pytest.raises(Exception) as info:
+        fn(*args)
+    return type(info.value), str(info.value)
+
+
+def test_logits_processor_loaders_share_the_fqcn_loader():
+    """Logits processors (V1 and V2) and diffusion policies resolve FQCNs the
+    same way (vllm.utils.import_utils.load_class_by_fqcn): same accepted
+    syntax, same errors for the same bad names."""
     from vllm.utils.import_utils import load_class_by_fqcn
     from vllm.v1.sample import logits_processor as v1
+    from vllm.v1.worker.gpu.dlm.policy import get_unmask_policy_cls
+    from vllm.v1.worker.gpu.sample.logits_processor import (
+        LogitsProcessor as V2Base,
+    )
     from vllm.v1.worker.gpu.sample.logits_processor import loader as v2
 
-    for fn in (v1._load_logitsprocs_by_fqcns, v2._load_v2_logitsprocs_by_fqcns):
-        src = inspect.getsource(fn)
-        assert "load_class_by_fqcn(" in src
-        assert "importlib.import_module" not in src
-    assert load_class_by_fqcn(f"{THIS}:LeftToRight", UnmaskPolicy, "x") is LeftToRight
+    class V1Proc(v1.LogitsProcessor):
+        pass
+
+    class V2Proc(V2Base):
+        pass
+
+    _Nest.V1Proc, _Nest.V2Proc = V1Proc, V2Proc
+    loaders = [
+        (lambda f: v1._load_logitsprocs_by_fqcns([f])[0], v1.LogitsProcessor,
+         "logits processor", "V1Proc"),
+        (lambda f: v2._load_v2_logitsprocs_by_fqcns([f])[0], V2Base,
+         "logits processor", "V2Proc"),
+        (lambda f: get_unmask_policy_cls(f), UnmaskPolicy,
+         "diffusion policy", "LeftToRight"),
+    ]  # fmt: skip
+    bad = [
+        "tests.attpatt_v100.test_dlm_plugins.LeftToRight",  # no colon
+        f"{THIS}:_Nest:LeftToRight",  # two colons
+        "tests.attpatt_v100.no_such_module:LeftToRight",
+        f"{THIS}:PROMPT",  # not a type
+        f"{THIS}:B8",  # not a type
+    ]
+    for load, base, kind, ok in loaders:
+        assert load(f"{THIS}:_Nest.{ok}") is getattr(_Nest, ok)
+        # A policy name without a colon is a registered name, not an FQCN.
+        for fqcn in bad[1:] if base is UnmaskPolicy else bad:
+            expected = _error(load_class_by_fqcn, fqcn, base, kind)
+            assert _error(load, fqcn) == expected, (kind, fqcn)
+        wrong = f"{THIS}:SimpleNamespace"  # a type, not a subclass
+        assert _error(load, wrong) == _error(load_class_by_fqcn, wrong, base, kind)

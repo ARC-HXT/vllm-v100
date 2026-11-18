@@ -21,6 +21,7 @@ from tests.attpatt_v100.dlm_harness import (  # noqa: E402
     make_sampler,
     normalized_params,
 )
+from vllm.v1.worker.gpu.dlm.policy import DlmStepDecision, UnmaskPolicy  # noqa: E402
 
 pytestmark = pytest.mark.cpu
 
@@ -298,3 +299,267 @@ def test_non_final_steps_sample_nothing_and_reject_everything():
         assert int(out.num_rejected[0]) == len(PROMPT) + 8
         assert int(out.num_sampled[0]) == (8 if step == 3 else 0)
     assert int((out.sampled_token_ids[0] == LLADA_MASK).sum()) == 0
+
+
+# --------------------------------------------------------------------------
+# Dream top_p / top_k at temperature 0 (official semantics, not dropped).
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("alg", ["maskgit_plus", "topk_margin", "entropy"])
+def test_dream_greedy_top_p_top_k_match_official(alg):
+    gen, steps, top_p, top_k = 16, 8, 0.5, 20
+    # Softer logits than ToyLM's default, so every row keeps >= 2 tokens (no
+    # confidence ties at 1.0, whose order torch.topk leaves open), top_p
+    # binds on some rows and top_k on the others.
+    ref_model, model = ToyLM(DREAM_VOCAB, seed=41), ToyLM(DREAM_VOCAB, seed=41)
+    ref_model.out = model.out = model.out * 0.5
+    x = official.dream_sample(
+        ref_model,
+        torch.tensor([PROMPT]),
+        max_length=len(PROMPT) + gen,
+        mask_token_id=DREAM_MASK,
+        steps=steps,
+        eps=1e-3,
+        alg=alg,
+        alg_temp=None,
+        temperature=0.0,
+        top_p=top_p,
+        top_k=top_k,
+    )
+    sampler = make_sampler("dream")
+    run = Run(sampler, {"r": model})
+    params = normalized_params(
+        "dream",
+        PROMPT,
+        gen,
+        temperature=0.0,
+        top_p=top_p,
+        top_k=top_k,
+        extra_args={"diffusion_max_steps": steps, "diffusion_policy": f"dream_{alg}"},
+    )
+    run.add("r", 0, PROMPT, params)
+    out = run.run_all()
+    for k, (ours, ref) in enumerate(zip(run.history["r"], ref_model.seen)):
+        assert torch.equal(ours, ref), f"step {k} input differs"
+    assert torch.equal(out["r"], x[0][len(PROMPT) :])
+
+
+# --------------------------------------------------------------------------
+# Custom policies get the unshifted final-norm rows (plan 2.6 item 2).
+# --------------------------------------------------------------------------
+
+
+class RecordHidden(UnmaskPolicy):
+    name = "test_record_hidden"
+    needs_hidden_states = True
+    seen: list = []
+
+    def score(self, x):
+        RecordHidden.seen.append(
+            (x.row_pos.clone(), x.hidden.clone(), x.logits.clone())
+        )
+        return {"x0": x.logits.argmax(-1), "confidence": x.logits.max(-1).values}
+
+    def select(self, x):
+        last = (x.step == x.num_steps - 1).unsqueeze(1)
+        return DlmStepDecision(revealed=x.is_masked & last)
+
+
+def test_dream_policy_hidden_states_are_unshifted():
+    # Dream's logits for canvas position j come from row P + j - 1; the
+    # hidden state a policy sees is the row of position j itself, P + j
+    # (policy.py, DlmScoreInputs.hidden).
+    RecordHidden.seen.clear()
+    model = ToyLM(DREAM_VOCAB, seed=9)
+    sampler = make_sampler("dream")
+    run = Run(sampler, {"r": model}, hidden_states=True)
+    params = normalized_params(
+        "dream",
+        PROMPT,
+        8,
+        extra_args={
+            "diffusion_policy": f"{__name__}:RecordHidden",
+            "diffusion_max_steps": 1,
+        },
+    )
+    run.add("r", 0, PROMPT, params)
+    run.run_all()
+    ((row_pos, hidden, logits),) = RecordHidden.seen
+    h = model.hidden(run.history["r"][0])
+    rows = len(PROMPT) + row_pos
+    assert torch.equal(logits, model.head(h[rows - 1]))
+    assert not torch.equal(hidden, h[rows - 1])
+    assert torch.equal(hidden, h[rows])
+
+
+# --------------------------------------------------------------------------
+# Value-level checks against the official functions.
+# --------------------------------------------------------------------------
+
+
+def _fixed_u(seeds, pos, salt, fp64=False):
+    j, step = (pos & 0xFFFF).double(), (pos >> 16).double()
+    u = torch.remainder(j * 0.6180339887 + step * 0.4142135623 + 0.05, 1.0)
+    return u if fp64 else u.float()
+
+
+def test_dream_origin_transfer_follows_the_official_formula(monkeypatch):
+    """Dream origin reveals a masked position when u < 1 - s/t (generation_utils
+    .py:421-426). With the uniforms fixed, the canvas must follow the official
+    loop step by step (a wrong p_transfer such as s/t changes it)."""
+    from vllm.v1.worker.gpu.dlm import builtin_policies
+
+    monkeypatch.setattr(builtin_policies, "hash_uniform", _fixed_u)
+    gen, steps, eps = 24, 6, 1e-3
+    model = ToyLM(DREAM_VOCAB, seed=13)
+    sampler = make_sampler("dream")
+    run = Run(sampler, {"r": model})
+    params = normalized_params(
+        "dream",
+        PROMPT,
+        gen,
+        temperature=0.0,
+        extra_args={"diffusion_max_steps": steps, "diffusion_policy": "dream_origin"},
+    )
+    run.add("r", 0, PROMPT, params)
+    out = run.run_all()
+
+    P = len(PROMPT)
+    x = torch.tensor(PROMPT + [DREAM_MASK] * gen)
+    timesteps = torch.linspace(1, eps, steps + 1)
+    for i in range(steps):
+        assert torch.equal(run.history["r"][i], x), f"step {i} input differs"
+        logits = model.logits(x)
+        logits = torch.cat([logits[:1], logits[:-1]])
+        t, s = timesteps[i], timesteps[i + 1]
+        p_transfer = 1 - s / t if i < steps - 1 else 1
+        j = torch.arange(gen)
+        u = _fixed_u(None, (torch.full_like(j, i) << 16) | j, 0)
+        transfer = (x[P:] == DREAM_MASK) & (u < p_transfer)
+        canvas = x[P:].clone()
+        canvas[transfer] = logits[P:].argmax(-1)[transfer]
+        x = torch.cat([x[:P], canvas])
+    assert torch.equal(out["r"], x[P:])
+
+
+def test_top_p_top_k_helpers_match_the_official_functions():
+    from vllm.v1.worker.gpu.dlm.builtin_policies import _top_k_logits, _top_p_logits
+
+    g = torch.Generator().manual_seed(0)
+    logits = torch.randn(6, 1000, generator=g) * 3
+    tied = torch.round(logits * 2) / 2  # many equal logits
+    for lg in (logits, tied):
+        top_p = [0.1, 0.5, 0.9, 0.999, 1.0, 0.3]
+        ours = _top_p_logits(lg, torch.tensor(top_p))
+        for r, p in enumerate(top_p):
+            ref = lg[r : r + 1] if p >= 1 else official.top_p_logits(lg[r : r + 1], p)
+            assert torch.equal(ours[r : r + 1], ref), (r, p)
+        top_k = [1, 5, 50, 999, 1000, 3]
+        ours = _top_k_logits(lg, torch.tensor(top_k))
+        for r, k in enumerate(top_k):
+            ref = official.top_k_logits(lg[r : r + 1], k)
+            assert torch.equal(ours[r : r + 1], ref), (r, k)
+
+
+# --------------------------------------------------------------------------
+# Distribution-level checks of the seeded randomness (CPU hash port of the
+# harness; temperature > 0 needs the Triton Gumbel kernel: test_dlm_gpu).
+# --------------------------------------------------------------------------
+
+# Chi-square critical values at p = 0.001 by degrees of freedom.
+_CHI2_999 = {3: 16.27, 7: 24.32}
+
+
+def _chi2(counts, probs):
+    expected = probs * counts.sum()
+    return float(((counts - expected) ** 2 / expected).sum())
+
+
+def test_llada_random_reveals_uniformly():
+    from vllm.v1.worker.gpu.dlm.builtin_policies import LLaDARandom
+    from vllm.v1.worker.gpu.dlm.policy import DlmRequestConfig, DlmScoreInputs
+
+    n, width = 4000, 8
+    cfg = DlmRequestConfig(
+        gen_length=width,
+        steps=width,
+        block_length=width,
+        policy="llada_random",
+        policy_args={"logits_eos_inf": False, "confidence_eos_eot_inf": False},
+    )
+    row_req = torch.arange(n).repeat_interleave(width)
+    zeros = torch.zeros(n, dtype=torch.int64)
+    out = LLaDARandom().score(
+        DlmScoreInputs(
+            logits=torch.zeros(n * width, 16),
+            hidden=None,
+            row_req=row_req,
+            row_pos=torch.arange(width).repeat(n),
+            row_slot=row_req,
+            row_token=torch.full((n * width,), LLADA_MASK),
+            row_req_np=row_req.numpy(),
+            step=zeros,
+            slots=torch.arange(n),
+            seeds=torch.arange(n, dtype=torch.int64) * 7919 + 1,
+            temperature=torch.zeros(n),
+            configs=[cfg] * n,
+            steps_np=zeros.numpy(),
+            state={},
+            mask_id=LLADA_MASK,
+        )
+    )
+    first = out["confidence"].view(n, width).argmax(1)
+    counts = torch.bincount(first, minlength=width).double()
+    assert _chi2(counts, torch.full((width,), 1 / width)) < _CHI2_999[width - 1]
+
+
+def test_dream_alg_temp_draws_from_softmax_of_confidence():
+    """alg_temp > 0: multinomial over softmax(confidence / alg_temp)
+    (generation_utils.py:443-446); one reveal per step here."""
+    from vllm.v1.worker.gpu.dlm.builtin_policies import DreamMaskGitPlus
+    from vllm.v1.worker.gpu.dlm.policy import DlmRequestConfig, DlmSelectInputs
+
+    n, width, steps, alg_temp = 4000, 4, 2, 0.5
+    policy = DreamMaskGitPlus()
+    cfg = DlmRequestConfig(
+        gen_length=width,
+        steps=steps,
+        block_length=width,
+        policy="dream_maskgit_plus",
+        policy_args={"eps": 1e-3, "alg_temp": alg_temp},
+    )
+    state = policy.alloc_state(n, width, torch.device("cpu"))
+    for slot in range(n):
+        policy.init_request(slot, cfg, state)
+    conf = torch.tensor([0.2, 0.5, 0.9, 0.4])
+    zeros = torch.zeros(n, dtype=torch.int64)
+    ones = torch.ones(n, width, dtype=torch.bool)
+    decision = policy.select(
+        DlmSelectInputs(
+            x0=torch.zeros(n, width, dtype=torch.int64),
+            confidence=conf.expand(n, width).clone(),
+            extras={},
+            canvas=torch.full((n, width), DREAM_MASK),
+            is_masked=ones,
+            valid=ones,
+            block_lo=zeros,
+            block_hi=zeros + width,
+            step=zeros,
+            step_in_block=zeros,
+            steps_per_block=zeros + steps,
+            num_steps=zeros + steps,
+            slots=torch.arange(n),
+            seeds=torch.arange(n, dtype=torch.int64) * 104729 + 3,
+            configs=[cfg] * n,
+            steps_np=zeros.numpy(),
+            state=state,
+            mask_id=DREAM_MASK,
+        )
+    )
+    revealed = decision.revealed
+    # k = int(4 * (1 - s / t)) = 1 at step 0 of 2 (eps 1e-3).
+    assert (revealed.sum(1) == 1).all()
+    counts = revealed.sum(0).double()
+    probs = torch.softmax(conf.double() / alg_temp, 0)
+    assert _chi2(counts, probs) < _CHI2_999[width - 1]
