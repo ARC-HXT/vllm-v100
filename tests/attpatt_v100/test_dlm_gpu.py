@@ -84,8 +84,7 @@ def ref_gen_len(meta: dict) -> int:
     return meta["gen_len"] if meta["model"] == "llada" else 512
 
 
-@pytest.fixture(scope="module")
-def llm():
+def make_llm():
     from vllm import LLM
 
     t0 = time.time()
@@ -106,8 +105,15 @@ def llm():
             "model": MODEL,
             "sec": round(time.time() - t0, 1),
             "compilation_config": os.environ.get("DLM_COMPILATION_CONFIG"),
+            "multiprocessing": os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING", "1"),
         }
     )
+    return engine
+
+
+@pytest.fixture(scope="module")
+def llm():
+    engine = make_llm()
     yield engine
     del engine
     gc.collect()
@@ -332,75 +338,6 @@ def test_trace_and_logprobs(llm):
     )
 
 
-# --------------------------------------------------------------------------
-# 4. Batch consistency: mixed lengths, policies, seeds; joins mid-run.
-# --------------------------------------------------------------------------
-
-
-def test_batch_matches_single_runs(llm):
-    refs = [load_ref(REF_SETS[MODEL][0], i) for i in GATE_ITEMS]
-    meta = refs[0]["meta"]
-    prompts = [r["prompt_ids"] for r in refs]
-    params = [sampling(meta) for _ in refs]
-    if MODEL == "llada":
-        # Different G / steps / block and a seeded random-remasking request.
-        params[1] = sampling(meta, diffusion_max_steps=64, diffusion_block_length=64)
-        params[1].max_tokens = 128
-        params[2] = sampling(meta, diffusion_policy="llada_random", seed=7)
-    else:
-        params[1] = sampling(meta, diffusion_max_steps=64)
-        params[1].max_tokens = 256
-        params[2] = sampling(meta, diffusion_policy="dream_entropy")
-    t0 = time.time()
-    single = [generate(llm, [prompts[0]], params[0])[0].outputs[0].token_ids]
-    sec_single0 = time.time() - t0
-    single += [
-        generate(llm, [p], q)[0].outputs[0].token_ids
-        for p, q in zip(prompts[1:], params[1:])
-    ]
-    together = [o.outputs[0].token_ids for o in generate(llm, prompts, params)]
-
-    # A request joining while another is mid-run. The engine core runs in its
-    # own process and emits a request's output only when it finishes, so
-    # engine.step() blocks until then: j3 is added after a third of j0's
-    # single-run time, and j0 must finish after that (it was still running).
-    engine = llm.llm_engine
-    from vllm.inputs import TokensPrompt
-
-    t0 = time.time()
-    engine.add_request(
-        "j0", TokensPrompt(prompt_token_ids=list(map(int, prompts[0]))), params[0]
-    )
-    time.sleep(sec_single0 / 3)
-    engine.add_request(
-        "j3", TokensPrompt(prompt_token_ids=list(map(int, prompts[3]))), params[3]
-    )
-    t_join = time.time() - t0
-    late: dict[str, list[int]] = {}
-    t_done: dict[str, float] = {}
-    while len(late) < 2 and engine.has_unfinished_requests():
-        for out in engine.step():
-            if out.finished:
-                late[out.request_id] = out.outputs[0].token_ids
-                t_done[out.request_id] = time.time() - t0
-    same_batch = [list(s) == list(t) for s, t in zip(single, together)]
-    same_late = [
-        list(late.get(r, [])) == list(single[i]) for r, i in (("j0", 0), ("j3", 3))
-    ]
-    report(
-        {
-            "test": "batch",
-            "same_batched": same_batch,
-            "same_mid_join": same_late,
-            "sec_single_j0": round(sec_single0, 2),
-            "sec_join": round(t_join, 2),
-            "sec_done": {k: round(v, 2) for k, v in t_done.items()},
-        }
-    )
-    assert all(same_batch) and all(same_late)  # fmt: skip
-    assert t_done["j0"] > t_join  # j3 really joined while j0 was running
-
-
 def test_seeded_sampling_is_reproducible(llm):
     ref = load_ref(REF_SETS[MODEL][0], 0)
     meta = ref["meta"]
@@ -424,39 +361,33 @@ def test_seeded_sampling_is_reproducible(llm):
 EDIT = "tests.attpatt_v100.test_dlm_custom_policies:FeatureEditPolicy"
 
 
-def test_custom_policy_in_the_worker(llm):
-    """The test policy of test_dlm_custom_policies (reveal, remask, rewrite,
-    hidden-state features) runs in the engine's worker; every operation
-    shows up in the trajectory; a batch mixing it with the built-in policy
-    gives the single-run results."""
-    refs = [load_ref(REF_SETS[MODEL][0], i) for i in range(2)]
-    meta = refs[0]["meta"]
-    prompts = [r["prompt_ids"] for r in refs]
-    edit = sampling(
+def edit_params(meta, **extra):
+    return sampling(
         meta,
         diffusion_policy=EDIT,
         diffusion_block_length=ref_gen_len(meta),
         diffusion_policy_args={"rewrite_gain": 0.0, "remask_logp": -0.5,
                                "feature_weight": 0.01},
-        diffusion_trace=True,
-        diffusion_trace_topk=1,
+        **extra,
     )  # fmt: skip
-    builtin = sampling(meta)
-    single = [
-        generate(llm, [prompts[0]], edit)[0].outputs[0],
-        generate(llm, [prompts[1]], builtin)[0].outputs[0],
-    ]
-    mixed = [o.outputs[0] for o in generate(llm, prompts, [edit, builtin])]
-    flags = single[0].dlm_trace["flags"]
+
+
+def test_custom_policy_in_the_worker(llm):
+    """The test policy of test_dlm_custom_policies (reveal, remask, rewrite,
+    hidden-state features), named by class path, is loaded and run in the
+    engine's worker process; every operation shows up in the trajectory.
+    Its batch behaviour is tested in test_dlm_batch_gpu.py."""
+    ref = load_ref(REF_SETS[MODEL][0], 0)
+    meta = ref["meta"]
+    out = generate(llm, [ref["prompt_ids"]], edit_params(meta, diffusion_trace=True))
+    out = out[0].outputs[0]
+    flags = out.dlm_trace["flags"]
     counts = {
         "reveal": int(((flags & 1) > 0).sum()),
         "remask": int(((flags & 2) > 0).sum()),
         "rewrite": int(((flags & 4) > 0).sum()),
     }
-    final_masks = int((np.array(single[0].token_ids) == MASK[MODEL]).sum())
-    same = [list(a.token_ids) == list(b.token_ids) for a, b in zip(single, mixed)]
-    report({"test": "custom_policy", "counts": counts,
-            "final_masks": final_masks, "mixed_equals_single": same})  # fmt: skip
+    final_masks = int((np.array(out.token_ids) == MASK[MODEL]).sum())
+    report({"test": "custom_policy", "counts": counts, "final_masks": final_masks})
     assert counts["remask"] > 0 and counts["rewrite"] > 0
     assert final_masks == 0
-    assert all(same)
