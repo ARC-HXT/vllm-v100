@@ -267,6 +267,7 @@ def test_abort_mid_run(tmp_path, async_scheduling):
     assert list(req.output_token_ids) == []
     assert sched.get_num_unfinished_requests() == 0
     assert not sched.schedule().num_scheduled_tokens
+    assert "r" not in sched.requests
 
 
 def test_async_preemption_drops_the_in_flight_outputs(tmp_path):

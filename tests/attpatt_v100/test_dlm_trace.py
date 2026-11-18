@@ -365,3 +365,32 @@ def test_logprob_stash_is_sized_by_the_requests(cpu_logprobs):
         == run.sequence("b")[5:].tolist()
     )
     assert not sampler.lp_stash  # released with the last step
+
+
+def test_abort_mid_run_then_slot_reuse(cpu_logprobs):
+    """Worker side of an abort (plan 2.2.2 item 6): the aborted request is
+    simply no longer scheduled, and the next request admitted to its slot
+    starts clean: same canvases and output as in a fresh sampler, and none
+    of the aborted request's state (logprob stash) survives."""
+    sampler = make_sampler("llada")
+    model_a = ToyLM(sampler.vocab_size, seed=5)
+    model_b = ToyLM(sampler.vocab_size, seed=7)
+    run = Run(sampler, {"a": model_a, "b": model_b})
+    run.add("a", 0, PROMPT, _params(logprobs=3))
+    _run_steps(run, [{"a": s} for s in range(3)])  # aborted after 3 of 8
+    assert sampler.lp_stash  # a's stash, still waiting for its last step
+    run.add("b", 0, PROMPT, _params(steps=4))
+    outs = _run_steps(run, [{"b": s} for s in range(4)])
+    assert outs[-1].logprobs_tensors is None
+    assert not sampler.lp_stash
+
+    fresh = Run(make_sampler("llada"), {"b": model_b})
+    fresh.add("b", 0, PROMPT, _params(steps=4))
+    fresh_outs = _run_steps(fresh, [{"b": s} for s in range(4)])
+    for k, (x, y) in enumerate(zip(run.history["b"], fresh.history["b"])):
+        assert torch.equal(x, y), f"step {k}"
+    n = int(outs[-1].num_sampled[0])
+    assert n == G == int(fresh_outs[-1].num_sampled[0])
+    assert torch.equal(
+        outs[-1].sampled_token_ids[0, :n], fresh_outs[-1].sampled_token_ids[0, :n]
+    )
