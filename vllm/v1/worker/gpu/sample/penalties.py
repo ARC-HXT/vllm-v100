@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -15,6 +16,11 @@ from vllm.v1.worker.gpu.sample.logits_processor.interface import (
     LogitsProcessor,
     LogitsProcRequestState,
 )
+
+# Penalty stub for samplers that apply no penalties (the diffusion
+# samplers): the runner reads penalties_state.output_bin_counts, and
+# post_update treats None as "no penalty bookkeeping".
+NO_PENALTIES_STATE = SimpleNamespace(output_bin_counts=None)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig

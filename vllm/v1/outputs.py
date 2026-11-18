@@ -310,6 +310,10 @@ class ModelRunnerOutput:
     # ``None`` when ``return_sampling_mask`` is off.
     sampling_masks: SamplingMaskLists | None = None
 
+    # Full-sequence diffusion: req_id -> this step's trajectory arrays
+    # ([G, ...] each), for requests that asked for it.
+    dlm_trace: dict[str, dict[str, np.ndarray]] | None = None
+
     @staticmethod
     def with_kv_conn_output_only(
         kv_connector_output: KVConnectorOutput | None,

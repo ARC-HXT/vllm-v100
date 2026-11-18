@@ -17,7 +17,6 @@ via Gemma4MultimodalEmbedder.
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -67,7 +66,7 @@ from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
-from vllm.v1.worker.gpu.sample.penalties import use_penalty
+from vllm.v1.worker.gpu.sample.penalties import NO_PENALTIES_STATE, use_penalty
 from vllm.v1.worker.gpu.states import RequestState
 
 from .interfaces import (
@@ -1122,12 +1121,6 @@ class DiffusionGemmaModelState(ModelState):
     num_new_sampled_tokens_per_step: int = 0
 
 
-# Penalty stub for the diffusion path: the runner reads
-# penalties_state.output_bin_counts, and post_update treats None as
-# "no penalty bookkeeping".
-_NO_PENALTIES_STATE = SimpleNamespace(output_bin_counts=None)
-
-
 class DiffusionSampler:
     """Batched accept/renoise sampler for DiffusionGemma.
 
@@ -1260,7 +1253,7 @@ class DiffusionSampler:
         # Diffusion applies no penalties. The runner reads
         # penalties_state.output_bin_counts, so expose a stub holding None;
         # post_update treats None bin counts as "no penalty bookkeeping".
-        return _NO_PENALTIES_STATE
+        return NO_PENALTIES_STATE
 
     # ------------------------------------------------------------------
     # Prefill

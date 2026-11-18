@@ -406,6 +406,10 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
             "tiny": "hmellor/tiny-random-LlamaForCausalLM",
         },
     ),
+    "LLaDAModelLM": _HfExamplesInfo(
+        "GSAI-ML/LLaDA-8B-Instruct",
+        trust_remote_code=True,
+    ),
     "LLaMAForCausalLM": _HfExamplesInfo(
         "decapoda-research/llama-7b-hf", is_available_online=False
     ),
@@ -513,6 +517,10 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
     ),
     "Plamo3ForCausalLM": _HfExamplesInfo(
         "pfnet/plamo-3-nict-2b-base",
+        trust_remote_code=True,
+    ),
+    "DreamModel": _HfExamplesInfo(
+        "Dream-org/Dream-v0-Instruct-7B",
         trust_remote_code=True,
     ),
     "Qwen2ForCausalLM": _HfExamplesInfo(

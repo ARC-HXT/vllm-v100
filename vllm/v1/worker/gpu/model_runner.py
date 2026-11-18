@@ -991,6 +991,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> None:
+        assert self.sampler is not None
+        if getattr(self.sampler, "consumes_hidden_states", False):
+            # The sampler projects hidden states itself (in row chunks), so
+            # let it reach its own peak for the memory profile.
+            self.sampler.dummy_run(hidden_states, self.model.compute_logits)
+            return
         num_reqs = hidden_states.shape[0]
         logits = self.model.compute_logits(hidden_states)
         dummy_input_batch = InputBatch.make_dummy(
@@ -1636,6 +1642,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
+        if getattr(self.sampler, "consumes_hidden_states", False):
+            # Full-sequence diffusion: logits for whole canvases do not fit at
+            # once, so the sampler projects the hidden states in row chunks.
+            assert self.sampler is not None
+            sampler_output = self.sampler.sample_hidden_states(
+                hidden_states, input_batch, self.model.compute_logits
+            )
+            return (
+                sampler_output,
+                sampler_output.num_sampled,
+                sampler_output.num_rejected,
+            )
+
         shard_metadata = None
         global_input_batch = input_batch
         if self.batch_sharder is not None:
@@ -1779,6 +1798,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.free_states(scheduler_output)
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)
+            self.model_state.begin_step(scheduler_output)
             if self.encoder_cache is not None:
                 # add_requests initializes RoPE positions from CPU metadata first.
                 for req_id, updates in scheduler_output.encoder_input_updates.items():

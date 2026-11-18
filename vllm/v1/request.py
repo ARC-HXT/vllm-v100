@@ -200,6 +200,16 @@ class Request:
         # True if this request is scheduled as a non-final prefill chunk.
         self.is_prefill_chunk = False
 
+        # Full-sequence diffusion (LLaDA / Dream): the prompt holds P + G
+        # tokens (canvas appended as mask ids) and every step re-runs all of
+        # them, so num_computed_tokens stays 0. The step count is fixed at
+        # admission; the scheduler hands each step its index.
+        self.dlm_total_steps = 0
+        self.dlm_steps_scheduled = 0
+        self.dlm_steps_done = 0
+        # DlmTraceAccumulator of a request that asked for its trajectory.
+        self.dlm_trace: Any = None
+
         # Block-aligned token position of a proven shared prefix worth pinning
         # in the (sparse) prefix cache; 0 means none. Set at admission for
         # hybrid/Mamba models when a shared prefix is detected (Marconi-style).

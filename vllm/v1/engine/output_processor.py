@@ -181,6 +181,10 @@ class StreamingUpdate:
 
 
 class RequestState:
+    # Full-sequence diffusion trajectory (arrives with the final output);
+    # a class default so states built without __init__ have it too.
+    dlm_trace: dict[str, np.ndarray] | None = None
+
     def __init__(
         self,
         request_id: str,
@@ -526,6 +530,7 @@ class RequestState:
             stop_reason=stop_reason if finished else None,
             spec_decode_metrics=self.spec_decode_metrics if finished else None,
             weight_versions=self._weight_version_spans() if finished else None,
+            dlm_trace=self.dlm_trace if finished else None,
         )
 
     def track_weight_version(self, weight_version: str) -> None:
@@ -786,6 +791,8 @@ class OutputProcessor:
                 req_state.routed_experts_chunks.append(
                     engine_core_output.routed_experts
                 )
+            if engine_core_output.dlm_trace is not None:
+                req_state.dlm_trace = engine_core_output.dlm_trace
 
             if req_state.is_prefilling:
                 if engine_core_output.prefill_stats is not None:

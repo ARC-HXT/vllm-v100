@@ -836,25 +836,38 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
-            num_new_tokens = (
-                request.num_tokens_with_spec
-                + request.num_output_placeholders
-                - request.num_computed_tokens
-            )
-            if 0 < long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = long_prefill_token_threshold
-            num_new_tokens = min(
-                num_new_tokens, token_budget, input_budget - draft_slots
-            )
+            if request.dlm_total_steps:
+                # Full-sequence diffusion: the whole prompt + canvas every
+                # step, never truncated or chunked (a chunk would not see the
+                # tokens after it). Skip once the last step is in flight, and
+                # skip a step that does not fit rather than cut it.
+                num_new_tokens = request.num_tokens
+                if (
+                    request.dlm_steps_scheduled >= request.dlm_total_steps
+                    or num_new_tokens > min(token_budget, input_budget - draft_slots)
+                ):
+                    req_index += 1
+                    continue
+            else:
+                num_new_tokens = (
+                    request.num_tokens_with_spec
+                    + request.num_output_placeholders
+                    - request.num_computed_tokens
+                )
+                if 0 < long_prefill_token_threshold < num_new_tokens:
+                    num_new_tokens = long_prefill_token_threshold
+                num_new_tokens = min(
+                    num_new_tokens, token_budget, input_budget - draft_slots
+                )
 
-            # Make sure the input position does not exceed the max model len.
-            # This is necessary when using spec decoding.
-            num_new_tokens = min(
-                num_new_tokens,
-                self.max_model_len
-                - request.num_computed_tokens
-                - self.num_sampled_tokens_per_step,
-            )
+                # Make sure the input position does not exceed the max model
+                # len. This is necessary when using spec decoding.
+                num_new_tokens = min(
+                    num_new_tokens,
+                    self.max_model_len
+                    - request.num_computed_tokens
+                    - self.num_sampled_tokens_per_step,
+                )
 
             # Apply Mamba alignment before encoder caps.
             if self.need_mamba_block_aligned_split:
@@ -1329,7 +1342,12 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens = padded_num_tokens
                             pad_spec_decode = True
 
-                    if 0 < long_prefill_token_threshold < num_new_tokens:
+                    if request.dlm_total_steps:
+                        # Full-sequence diffusion: all of prompt + canvas or
+                        # nothing, whatever the chunked-prefill setting.
+                        if num_new_tokens > request_token_budget:
+                            break
+                    elif 0 < long_prefill_token_threshold < num_new_tokens:
                         num_new_tokens = long_prefill_token_threshold
 
                     # chunked prefill has to be enabled explicitly to allow
@@ -1834,6 +1852,13 @@ class Scheduler(SchedulerInterface):
         )
         request.num_stale_output_tokens = request.num_in_flight_tokens
         request.num_output_placeholders = 0
+        if request.dlm_total_steps:
+            # The worker drops the slot and restarts from an all-mask canvas,
+            # so the in-flight steps' outputs belong to the old run.
+            request.dlm_steps_scheduled = 0
+            request.dlm_steps_done = 0
+            request.dlm_trace = None
+            request.drop_stale_output = True
         request.num_preemptions += 1
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
@@ -1855,6 +1880,19 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
+            if request.dlm_total_steps:
+                # Full-sequence diffusion never advances: every step is a
+                # whole prefill. Async scheduling sees a prefill chunk and
+                # adds no output placeholders.
+                if scheduler_output.dlm_steps is None:
+                    scheduler_output.dlm_steps = {}
+                scheduler_output.dlm_steps[req_id] = request.dlm_steps_scheduled
+                request.dlm_steps_scheduled += 1
+                request.num_in_flight_tokens += num_scheduled_token
+                if self.defer_block_free:
+                    request.last_sched_seq = self.sched_step_seq
+                request.is_prefill_chunk = True
+                continue
             request.num_computed_tokens += num_scheduled_token
             request.num_in_flight_tokens += num_scheduled_token
             if self.defer_block_free:
@@ -2389,6 +2427,30 @@ class Scheduler(SchedulerInterface):
                 self._free_encoder_inputs(request)
 
             stopped = False
+            if request.dlm_total_steps and not output_is_stale:
+                dlm_trace = model_runner_output.dlm_trace
+                if dlm_trace is not None and req_id in dlm_trace:
+                    if request.dlm_trace is None:
+                        from vllm.v1.worker.gpu.dlm.trace import (
+                            DlmTraceAccumulator,
+                        )
+
+                        request.dlm_trace = DlmTraceAccumulator(request.dlm_total_steps)
+                    request.dlm_trace.add(request.dlm_steps_done, dlm_trace[req_id])
+                request.dlm_steps_done += 1
+                if (
+                    request.dlm_steps_done >= request.dlm_total_steps
+                    and not generated_token_ids
+                ):
+                    # The last step must return the canvas; never hang.
+                    logger.error(
+                        "Diffusion request %s returned no tokens on its last "
+                        "step; terminating it.",
+                        req_id,
+                    )
+                    request.status = RequestStatus.FINISHED_ERROR
+                    request.resumable = False
+                    stopped = True
             new_logprobs = None
             new_sampling_mask = None
             new_token_ids = generated_token_ids
@@ -2531,6 +2593,12 @@ class Scheduler(SchedulerInterface):
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        dlm_trace=(
+                            request.dlm_trace.result()
+                            if finish_reason is not None
+                            and request.dlm_trace is not None
+                            else None
+                        ),
                     )
                 )
             else:

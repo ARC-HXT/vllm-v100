@@ -116,6 +116,43 @@ def import_from_path(module_name: str, file_path: str | os.PathLike) -> ModuleTy
     return module
 
 
+def load_class_by_fqcn(fqcn: str, base_cls: type, kind: str) -> type:
+    """Load the class named by ``fqcn`` (``<module>:<qualname>``, the syntax
+    of entry-point values) and check that it subclasses ``base_cls``.
+
+    The module is imported with CUDA initialization blocked. Shared by the
+    logits-processor loaders and the diffusion unmasking-policy registry;
+    ``kind`` names the plugin type in error messages.
+    """
+    parts = fqcn.split(":")
+    if len(parts) != 2:
+        raise ValueError(
+            f"Invalid {kind} FQCN {fqcn!r}. Expected format: '<module>:<type>'"
+        )
+    module_path, qualname = parts
+
+    from vllm.utils.torch_utils import guard_cuda_initialization
+
+    try:
+        with guard_cuda_initialization():
+            module = importlib.import_module(module_path)
+    except Exception as e:
+        logger.error("Failed to load %s %s: %s", kind, fqcn, e)
+        raise RuntimeError(f"Failed to load {kind} {fqcn}") from e
+
+    obj: Any = module
+    for attr in qualname.split("."):
+        obj = getattr(obj, attr)
+    if not isinstance(obj, type):
+        raise ValueError(f"Loaded {kind} must be a type, got {obj!r}.")
+    if not issubclass(obj, base_cls):
+        raise ValueError(
+            f"{obj.__name__} is not a subclass of "
+            f"{base_cls.__module__}.{base_cls.__qualname__}"
+        )
+    return obj
+
+
 def resolve_obj_by_qualname(qualname: str) -> Any:
     """Resolve an object by its fully-qualified class name."""
     module_name, obj_name = qualname.rsplit(".", 1)

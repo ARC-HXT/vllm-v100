@@ -8,7 +8,6 @@ side modules (torch, triton, worker state). Imports needed to instantiate
 processors are deferred to ``build_custom_logits_processors``.
 """
 
-import importlib
 from collections.abc import Callable, Sequence
 from functools import lru_cache
 from importlib.metadata import entry_points
@@ -16,6 +15,7 @@ from typing import TYPE_CHECKING
 
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
+from vllm.utils.import_utils import load_class_by_fqcn
 from vllm.v1.worker.gpu.sample.logits_processor.interface import (
     LogitsProcessor,
     LogitsProcRequestState,
@@ -81,10 +81,8 @@ def _load_v2_logitsprocs_by_fqcns(
 
     FQCN syntax is <module>:<type> i.e. x.y.z:CustomLogitProc.
     """
-    from vllm.utils.torch_utils import guard_cuda_initialization
-
     classes: list[type[LogitsProcessor]] = []
-    for ldx, logitproc in enumerate(logits_processors):
+    for logitproc in logits_processors:
         if isinstance(logitproc, type):
             logger.debug(" - Already-loaded logit processor: %s", logitproc.__name__)
             if not issubclass(logitproc, LogitsProcessor):
@@ -96,39 +94,9 @@ def _load_v2_logitsprocs_by_fqcns(
             continue
 
         logger.debug("- Loading logits processor %s", logitproc)
-        parts = logitproc.split(":")
-        if len(parts) != 2:
-            raise ValueError(
-                f"Invalid logits processor FQCN {logitproc!r}. "
-                "Expected format: '<module>:<type>'"
-            )
-        module_path, qualname = parts
-
-        try:
-            with guard_cuda_initialization():
-                module = importlib.import_module(module_path)
-        except Exception as e:
-            logger.error(
-                "Failed to load %sth LogitsProcessor plugin %s: %s",
-                ldx,
-                logitproc,
-                e,
-            )
-            raise RuntimeError(
-                f"Failed to load {ldx}th LogitsProcessor plugin {logitproc}"
-            ) from e
-
-        obj = module
-        for attr in qualname.split("."):
-            obj = getattr(obj, attr)
-        if not isinstance(obj, type):
-            raise ValueError("Loaded logit processor must be a type.")
-        if not issubclass(obj, LogitsProcessor):
-            raise ValueError(
-                f"{obj.__name__} is not a subclass of "
-                "vllm.v1.worker.gpu.sample.logits_processor.LogitsProcessor"
-            )
-        classes.append(obj)
+        classes.append(
+            load_class_by_fqcn(logitproc, LogitsProcessor, "logits processor")
+        )
 
     return classes
 
