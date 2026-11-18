@@ -51,6 +51,7 @@ def table(tmp_path_factory):
         mp.setattr(G, "_table", {})
         mp.setattr(G, "_ready", set())
         mp.setattr(G, "_ws", {})
+        mp.setattr(G, "_ws32", {})
         G.prepare(torch.device("cuda", 0))
         yield
 

@@ -123,6 +123,9 @@ def matmul(x, w, y, cfg, ws=None, bias=None):
         _mm[a["grid"]](x, w, b, y, M, N, K, x.stride(0), w.stride(0), a["kps"], BM=a["BM"], BN=BN, BK=BK, SPLIT=1,
                        HAS_BIAS=has_bias, num_warps=warps, num_stages=stages)
         return
+    if ws is None or ws.dtype != torch.float32 or ws.numel() < SPLIT * M * N:  # host-side check, capture-safe
+        raise ValueError(f"split-K workspace too small: needs {SPLIT * M * N} fp32 elements, got "
+                         f"{None if ws is None else (ws.dtype, ws.numel())}")
     _mm[a["grid"]](x, w, b, ws, M, N, K, x.stride(0), w.stride(0), a["kps"], BM=a["BM"], BN=BN, BK=BK, SPLIT=SPLIT,
                    HAS_BIAS=False, num_warps=warps, num_stages=stages)
     MN = M * N

@@ -63,8 +63,9 @@ CACHE_DIR = default_cache_dir()
 
 _table = {}  # (device index, M, N, K, bias) -> CPU int64 row (16, cuBLASLt), tuple (gemm_triton configuration) or None
 _ready = set()  # device indices whose table is loaded / built for ON_SHAPES
-_ws = {}  # device index -> workspace (uint8), allocated once in prepare()
-_ws32 = {}  # device index -> fp32 split-K workspace of the Triton entries, allocated once in prepare()
+_ws = {}  # device index -> workspace (uint8), allocated in prepare(), grown there when a table needs more
+_ws32 = {}  # device index -> fp32 split-K workspace of the Triton entries, allocated / grown in prepare()
+_retired = []  # workspaces replaced by a larger one: kept alive for CUDA graphs captured against them
 _logged = set()
 
 
@@ -396,10 +397,19 @@ def prepare(dev):
         if row is not None:
             lt.prepare(M, N, K, bias)
             need = max(need, int(row[15]))
-    if i not in _ws:
-        _ws[i] = torch.empty(max(need, 256), dtype=torch.uint8, device=torch.device("cuda", i))
-    if i not in _ws32:
-        _ws32[i] = torch.empty(max(need32, 64), dtype=torch.float32, device=torch.device("cuda", i))
+    # A workspace kept from an earlier prepare() of another table can be smaller than this table needs (a split-K
+    # Triton entry with M * N * SPLIT fp32 partial sums wrote past it: garbage outputs in test_gemm_bias at M=128 after
+    # test_gemm_decode had sized the buffer, v100.11 release gate 2026-11-18).  Grow it; the old buffer stays referenced
+    # in _retired because a CUDA graph captured against it may still replay.
+    dev_i = torch.device("cuda", i)
+    if i not in _ws or _ws[i].numel() < need:
+        if i in _ws:
+            _retired.append(_ws[i])
+        _ws[i] = torch.empty(max(need, 256), dtype=torch.uint8, device=dev_i)
+    if i not in _ws32 or _ws32[i].numel() < need32:
+        if i in _ws32:
+            _retired.append(_ws32[i])
+        _ws32[i] = torch.empty(max(need32, 64), dtype=torch.float32, device=dev_i)
     _ready.add(i)
     used = sum(1 for k, v in _table.items() if k[0] == i and v is not None)
     _log(f"table ready on cuda:{i}: {used} of {len(recs)} (M, N, K, bias) entries use the table ({n_tri} Triton, "

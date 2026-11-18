@@ -127,6 +127,30 @@ def test_table_selects_triton_where_it_wins_and_dispatches_to_it(table, monkeypa
     assert torch.equal(yg, y)
 
 
+def test_split_k_refuses_a_workspace_smaller_than_its_partial_sums():
+    x, w, _ = data(64, 9728, 2560, 6)
+    y = torch.empty(64, 2560, dtype=torch.float16, device=DEV)
+    cfg = (64, 128, 4, 4, 2)
+    with pytest.raises(ValueError, match="split-K workspace too small"):
+        T.matmul(x, w, y, cfg, torch.empty(T.workspace_elems(64, 2560, cfg) - 1, dtype=torch.float32, device=DEV))
+
+
+def test_prepare_grows_a_workspace_left_by_an_earlier_table(table, monkeypatch):
+    """a split-K entry of this table needs more fp32 partial sums than the workspace an earlier prepare() allocated
+    (v100.11 release gate 2026-11-18: test_gemm_bias at M=128 read garbage after test_gemm_decode had sized it)"""
+    K, N, M, cfg = 9728, 2560, 64, (64, 128, 4, 4, 2)
+    rec = dict(M=M, N=N, K=K, bias=False, row=None, tri=list(cfg), tri_checked=True)
+    G._store(G._cache_file(DEV, str(table)), {(M, N, K, False): rec}, str(table))
+    small = torch.empty(64, dtype=torch.float32, device=DEV)
+    monkeypatch.setitem(G._ws32, 0, small)
+    _load(table, monkeypatch, [(K, N)])
+    assert G.entry(0, M, N, K) == cfg
+    assert G._ws32[0].numel() >= T.workspace_elems(M, N, cfg)
+    assert any(r is small for r in G._retired)  # kept alive for graphs captured against it
+    x, w, _ = data(M, K, N, 7)
+    assert torch.equal(G.gemm(x, w), run(x, w, cfg))
+
+
 def test_record_without_triton_check_is_upgraded_by_build_not_by_engines(table, monkeypatch):
     """a v100.9 record (cuBLASLt row, no tri_checked): the engine (select=False) uses it as it is; `gemm build` adds
     the Triton candidates and keeps the old row as the cuBLASLt arm"""
