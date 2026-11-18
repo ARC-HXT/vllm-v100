@@ -74,6 +74,51 @@ get the Triton candidates added (their cuBLASLt algorithm is kept as one arm, cu
 Triton entries for M 16 / 32 / 64): 40.66 -> 40.03, 42.70 -> 41.82, 50.41 -> 45.06 ms per step at 16 / 32 / 64 running
 requests.
 
+## Full-sequence diffusion LMs: LLaDA-8B and Dream-7B (since v0.33.0+v100.11)
+
+LLaDA (`LLaDAModelLM`) and Dream (`DreamModel`) run natively on Model Runner V2 with the official decoding semantics:
+every denoising step re-runs prompt + canvas bidirectionally (no KV reuse across steps, no approximate cache), and
+the canvas update follows the official code (LLaDA `generate.py`, Dream `generation_utils.py`). The fp32 lm_head of
+the official runs is the default (`head_dtype` float32).
+
+```python
+from vllm import LLM, SamplingParams
+llm = LLM(model="<LLaDA-8B-Instruct dir>", dtype="float16", trust_remote_code=True)
+params = SamplingParams(max_tokens=256, temperature=0.0,  # max_tokens = gen_length (LLaDA) / max_new_tokens (Dream)
+                        extra_args={"diffusion_max_steps": 256, "diffusion_block_length": 32,
+                                    "diffusion_policy": "llada_low_confidence"})
+out = llm.generate(prompts, params)
+```
+
+- Standard fields carry the official parameters of the same meaning: `max_tokens`, `temperature`, `top_p` / `top_k`
+  (Dream only; LLaDA rejects them, its `generate()` has none), `seed`. They are applied as given, including
+  `top_p` / `top_k` at temperature 0 and temperatures below 0.01 (vLLM's own sampler would drop or raise them).
+  `SamplingParams()` defaults to temperature 1.0 as everywhere in vLLM; the official default is 0, so set it.
+- `extra_args`: `diffusion_max_steps` (steps), `diffusion_block_length` (LLaDA block_length), `diffusion_policy`
+  (LLaDA remasking: `llada_low_confidence`, `llada_random`; Dream alg: `dream_origin`, `dream_maskgit_plus`,
+  `dream_topk_margin`, `dream_entropy`), `diffusion_policy_args` (e.g. Dream `eps`, `alg_temp`). Defaults are the
+  official ones: LLaDA's `generate()` signature (128 steps, block 128, low_confidence), Dream's
+  `generation_config.json`. `max_tokens` must be a multiple of the block length and the steps a multiple of the
+  number of blocks, as the official asserts require.
+- Not supported, rejected at admission: `stop`, `stop_token_ids`, `min_tokens`, `min_p`, penalties, `logit_bias`,
+  `bad_words`, `allowed_token_ids`, `prompt_logprobs`, `logprobs=-1`. The whole canvas is returned (EOS does not end a
+  request early), decoded like the official code.
+- `extra_args={"diffusion_trace": True, "diffusion_trace_topk": K}` returns the per-step trajectory (canvas, chosen
+  log-probabilities, top-K) in `RequestOutput.dlm_trace` (+9-11 % time for 256 / 128 steps).
+- Custom unmasking policies: subclass `vllm.v1.worker.gpu.dlm.policy.UnmaskPolicy` and name it in a request by a
+  registered name (`register_unmask_policy` from a `vllm.general_plugins` entry point), an entry point of group
+  `vllm.diffusion_policies`, or `<module>:<class>`.
+- Limits: prompt + `max_tokens` up to the model's positions (or a smaller configured `max_model_len`) and up to
+  `max_num_batched_tokens` (a step is never chunked); no prefix caching, LoRA, speculative decoding, PP or DP.
+  Results of one request can differ in the last bits between batch compositions (cuBLAS picks algorithms by the
+  batch's token count); the same batch composition is bitwise reproducible.
+
+Measured on V100 (GSM8K test items 0-99, LightEval extractive match, greedy): LLaDA 256 steps / gen 256 / block 32
+0.80 vs the official HF code 0.80 (91 of 100 outputs token-identical); Dream 128 steps / 512 tokens / maskgit_plus
+0.51 vs 0.55 (difference not significant, 95 % interval -0.11 .. 0.03). Where outputs differ, they first diverge at a
+reveal between positions whose confidences tie in fp32 or differ in the last bit. LLaDA, 256 steps, gen 256: 0.10 s
+per step for one request, 0.62 s for eight.
+
 ## Build and artifacts (GitHub Actions)
 
 `.github/workflows/attpatt-v100-wheel.yml` builds the complete CUDA wheel from
